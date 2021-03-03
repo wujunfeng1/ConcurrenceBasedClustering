@@ -52,6 +52,7 @@ package ConcurrenceBasedClustering
 import (
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"time"
 )
@@ -348,69 +349,68 @@ func (cm ConcurrenceModel) InduceSimilarities() map[uint]map[uint]float64 {
 }
 
 // =============================================================================
-// func (cm ConcurrenceModel) connectsWell
-// brief description: check whether the concurrence graph connects a node well
-//	in a partition of communities.
+// func (cm ConcurrenceModel) connects
+// brief description: check whether the concurrence graph connects two nodes.
 // input:
-//	u: a node ID
-//	cu: the communityID of u
-//	communities: a list of clusters
-//	r: a threshold
+//	u, v: two node IDs
 // output:
-//	true if it connects well, false otherwise
-func (cm ConcurrenceModel) connectsWell(u, cu uint, communities []map[uint]bool,
-	r float64) bool {
-	c := communities[cu]
-	weightsOfU := cm.GetConcurrencesOf(u)
-	x := 0.0
-	for v, _ := range c {
-		if v == u {
-			continue
-		}
-		weightUV, exists := weightsOfU[v]
-		if exists {
-			x += float64(weightUV)
-		}
-	}
-	return x >= r*float64(len(c)-1)
+//	true if it connects them, false otherwise
+func (cm ConcurrenceModel) Connects(u, v uint) bool {
+	return cm.GetConcurrence(u, v) > 0
 }
 
 // =============================================================================
-// func (cm ConcurrenceModel) connectsWellBetween
-// brief description: check whether the concurrence graph connects a node well
-//	in a partition of communities.
+// func (cm ConcurrenceModel) connectsWell
+// brief description: check whether the concurrence graph connects a subset well
+//	from a set of node IDs.
 // input:
-//	cu, cv: two communityIDs
-//	communities: a list of clusters
+//	subset: a subset of idSet
+//	set: a set of node IDs
 //	r: a threshold
 // output:
 //	true if it connects well, false otherwise
-func (cm ConcurrenceModel) connectsWellTo(u, cu uint, communities []map[uint]bool,
-	r float64) bool {
-	c := communities[cu]
-	weightsOfU := cm.GetConcurrencesOf(u)
-	x := 0.0
-	for v, _ := range c {
-		if v == u {
+func (cm ConcurrenceModel) ConnectsWell(subset, set map[uint]bool, r float64,
+) bool {
+	// -------------------------------------------------------------------------
+	// step 1: find the complement of subset in set
+	complement := map[uint]bool{}
+	for v, _ := range set {
+		_, inSubset := subset[v]
+		if inSubset {
 			continue
 		}
-		weightUV, exists := weightsOfU[v]
-		if exists {
-			x += float64(weightUV)
+		complement[v] = true
+	}
+
+	// -------------------------------------------------------------------------
+	// step 2: sum the weights between the subset and the complement
+	x := 0.0
+	for u, _ := range subset {
+		weightsOfU := cm.GetConcurrencesOf(u)
+		for v, _ := range complement {
+			weightUV, exists := weightsOfU[v]
+			if exists {
+				x += float64(weightUV)
+			}
 		}
 	}
-	return x >= r*float64(len(c)-1)
+
+	// -------------------------------------------------------------------------
+	// step 3: return the result
+	return x >= r*float64(len(subset)*len(complement))
 }
 
 // =============================================================================
 // interface QualityModel
 // brief description: This is an interface for quality models
 type QualityModel interface {
-	// The first two methods are parts of ConcurrenceModel. Therefore, for
-	// those structs merged with ConcurreneModel, they already have these two
+	// The first four methods are parts of ConcurrenceModel. Therefore, for
+	// those structs merged with ConcurreneModel, they already have these four
 	// methods
 	GetN() uint
 	GetCompleteCommunities(communities []map[uint]bool) []map[uint]bool
+	ConnectsWell(subset, set map[uint]bool, r float64) bool
+	Connects(u, v uint) bool
 
 	// This method is simiar to that of ConcurrenceModel. The difference is the
 	// return value.
@@ -1070,7 +1070,7 @@ func Louvain(qm QualityModel, communities []map[uint]bool, opts ...string,
 
 		// ---------------------------------------------------------------------
 		// (6.2) compute aggregated result from the aggregate network
-		aggResult := Louvain(qm, result, opts...)
+		aggResult := Louvain(newQM, []map[uint]bool{}, opts...)
 
 		// ---------------------------------------------------------------------
 		// (6.3) check whether the new result has merged something. If it has,
@@ -1083,6 +1083,187 @@ func Louvain(qm QualityModel, communities []map[uint]bool, opts ...string,
 	// -------------------------------------------------------------------------
 	// step 7: return the result
 	return result
+}
+
+// =============================================================================
+// func refineForLeiden
+// brief description: refine communities for Leiden algorithm
+// input:
+//	qm: a quality model.
+//	communities: a list of clusters
+//	gamma: the threshold for qm.connectsWell
+//	theta: a threshold for sampling probablities
+// output:
+//	refinedCommunities, refinement
+//	refinedCommunities: the result communities refined from input communities.
+//	refinement: for each input community, list which refined communities it
+//		contains.
+func refineForLeiden(qm QualityModel, communities []map[uint]bool,
+	gamma, theta float64) ([]map[uint]bool, []map[uint]bool) {
+	if gamma <= 0.0 || theta <= 0.0 {
+		log.Fatal("gamma and theta must be > 0.")
+	}
+
+	// -------------------------------------------------------------------------
+	// step 1: initialize result with singleton communities
+	n := qm.GetN()
+	refinedCommunties := make([]map[uint]bool, n)
+	for i := uint(0); i < n; i++ {
+		refinedCommunties[i] = map[uint]bool{i: true}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 2: find out for each point which input community it is in.
+	inputCommunityID := make([]int, n)
+	for idxC, c := range communities {
+		for u, _ := range c {
+			inputCommunityID[u] = idxC
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 3: iteratively merge communities in result based on five rules:
+	//	1. 	A community in result can only be merged with a sub-community in
+	//		one of the input communties.
+	//	2.	A communtiy in result is merged only if the merge increases the
+	//		quality of the result.
+	//	3.	Two communities are merged only if both of them are well connected
+	//		to input communities with threshold gamma and at least one of them
+	//		is singleton.
+	//	4.	Tow communities are merged only if they are connected.
+	//	5.	When a community can be merged with multiple communities, we select
+	//		which to be merged with randomly with sampling probablities set as
+	//		proportional to 1/theta * qualityGain
+	for {
+		done := true
+		for i, refinedCi := range refinedCommunties {
+			// ----------------------------------------------------------------
+			// (3.1) skip non-singleton communities in result
+			if len(refinedCi) > 1 {
+				continue
+			}
+
+			// ----------------------------------------------------------------
+			// (3.2) skip those refinedCi not connected well with any of the
+			// input communities
+			inputC := communities[inputCommunityID[i]]
+			if !qm.ConnectsWell(refinedCi, inputC, gamma) {
+				continue
+			}
+
+			// ----------------------------------------------------------------
+			// (3.3) find those result communities in the same input community
+			// as refinedC that has at least one node connected to refinedCi.
+			// This enforces rule 1 and 4.
+			connected := []uint{}
+			u := uint(i)
+			for j, _ := range inputC {
+				refinedCj := refinedCommunties[j]
+				// skip empty result communities
+				if len(refinedCj) == 0 {
+					continue
+				}
+
+				// Check whether there is at least one node connected to
+				// refinedCi. If there is, append j to connected
+				for v, _ := range refinedCj {
+					if qm.Connects(u, v) {
+						connected = append(connected, j)
+						break
+					}
+				}
+			}
+
+			// ----------------------------------------------------------------
+			// (3.4) scan throughs connected to search for those resultCi can
+			// be merged with.
+			logProb := map[uint]float64{}
+			sumLogProb := 0.0
+			for _, j := range connected {
+				refinedCj := refinedCommunties[j]
+
+				// Skip this refinedCj if it is not connected well to inputC.
+				// This completes the enforcement of rule 3 with (3.1) & (3.2).
+				if !qm.ConnectsWell(refinedCj, inputC, gamma) {
+					continue
+				}
+
+				// Compute the quality gain when merging resultCi and resultCj
+				deltaQuality := qm.DeltaQuality(refinedCommunties, u, u, j)
+
+				// Skip this if the quality gain is not positive
+				if deltaQuality <= 0.0 {
+					continue
+				}
+
+				// record a sampling probability
+				myLogProb := deltaQuality / theta
+				logProb[j] = myLogProb
+				sumLogProb += myLogProb
+			}
+
+			// ----------------------------------------------------------------
+			// (3.5) if none resultCi be merged with, skip this resultCi
+			if len(logProb) == 0 {
+				continue
+			}
+
+			// ----------------------------------------------------------------
+			// (3.6) normalize the sampling probabilities
+			for j, value := range logProb {
+				logProb[j] = value - sumLogProb
+			}
+
+			// ----------------------------------------------------------------
+			// (3.7) sample a resultCj using logProb
+			// first, get a random number x within [0.0, 1.0)
+			x := rand.Float64()
+			// then, scan through logProb to find the sample
+			y := 0.0
+			sample := uint(0)
+			for j, value := range logProb {
+				prob := math.Exp(value)
+				y += prob
+				if y >= x {
+					sample = j
+					break
+				}
+			}
+
+			// ----------------------------------------------------------------
+			// (3.8) now merge resultCi and sample
+			refinedCommunties[i] = map[uint]bool{}
+			refinedCommunties[sample][u] = true
+			done = false
+		}
+
+		// ---------------------------------------------------------------------
+		// end the loop if no merge happens
+		if done {
+			break
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 4: remove empty communties in result and record non-empty ones in
+	// the refinement mapping
+	oldRefinedCommunities := refinedCommunties
+	refinedCommunties = []map[uint]bool{}
+	refinement := make([]map[uint]bool, len(communities))
+	for i := 0; i < len(communities); i++ {
+		refinement[i] = map[uint]bool{}
+	}
+	for i, c := range oldRefinedCommunities {
+		if len(c) > 0 {
+			newI := uint(len(refinedCommunties))
+			refinement[inputCommunityID[i]][newI] = true
+			refinedCommunties = append(refinedCommunties, c)
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 5: return the result
+	return refinedCommunties, refinement
 }
 
 // =============================================================================
@@ -1099,8 +1280,8 @@ func Louvain(qm QualityModel, communities []map[uint]bool, opts ...string,
 //	If the input communities is empty, this function will act as the classical
 //	Leiden algorithm that uses single point communities as the initial
 //	communities.
-func Leiden(qm QualityModel, communities []map[uint]bool, opts ...string,
-) []map[uint]bool {
+func Leiden(qm QualityModel, communities []map[uint]bool, gamma, theta float64,
+	opts ...string) []map[uint]bool {
 	// step 1: parsing options
 	useSeqSelector := true
 	multiResolution := true
@@ -1221,19 +1402,20 @@ func Leiden(qm QualityModel, communities []map[uint]bool, opts ...string,
 	// step 6: if required, do the multi-resolution part
 	if multiResolution {
 		// ---------------------------------------------------------------------
-		// (6.1) create aggregate network from the result
-		newQM := qm.Aggregate(result)
+		// (6.1) refine the result
+		refinedCommunities, refinement := refineForLeiden(qm, result, gamma, theta)
+
+		// ---------------------------------------------------------------------
+		// (6.2) create aggregate network from refined
+		newQM := qm.Aggregate(refinedCommunities)
 
 		// ---------------------------------------------------------------------
 		// (6.2) compute aggregated result from the aggregate network
-		aggResult := Leiden(qm, result, opts...)
+		aggResult := Leiden(newQM, refinement, gamma, theta, opts...)
 
 		// -------------------------------------------------------------------------
-		// (6.3) check whether the new result has merged something. If it has,
-		// then revise the result accordingly
-		if uint(len(aggResult)) < newQM.GetN() {
-			result = flattenCommunities(aggResult, result)
-		}
+		// (6.3) flatten the aggResult with refinedCommunities into result
+		result = flattenCommunities(aggResult, refinedCommunities)
 	}
 
 	// -------------------------------------------------------------------------
