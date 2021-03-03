@@ -69,9 +69,9 @@ func init() {
 // brief description: This is a struct for concurrence models
 type ConcurrenceModel struct {
 	n                 uint
-	sumConcurrences   uint
-	sumConcurrencesOf []uint
-	concurrences      map[uint]map[uint]uint
+	sumConcurrences   float64
+	sumConcurrencesOf []float64
+	concurrences      map[uint]map[uint]float64
 }
 
 // =============================================================================
@@ -80,9 +80,9 @@ type ConcurrenceModel struct {
 func NewConcurrenceModel() ConcurrenceModel {
 	return ConcurrenceModel{
 		n:                 0,
-		sumConcurrences:   0,
-		sumConcurrencesOf: []uint{},
-		concurrences:      map[uint]map[uint]uint{},
+		sumConcurrences:   0.0,
+		sumConcurrencesOf: []float64{},
+		concurrences:      map[uint]map[uint]float64{},
 	}
 }
 
@@ -96,7 +96,7 @@ func NewConcurrenceModel() ConcurrenceModel {
 //		the	element is 0.
 // output:
 //	nothing, but will raise fatal exceptions otherwise.
-func verifyConcurrences(n uint, concurrences map[uint]map[uint]uint) {
+func verifyConcurrences(n uint, concurrences map[uint]map[uint]float64) {
 	maxNodeID := uint(0)
 	for u, weightsOfU := range concurrences {
 		if u > maxNodeID {
@@ -132,12 +132,13 @@ func verifyConcurrences(n uint, concurrences map[uint]map[uint]uint) {
 //		then the element is 0.
 // output:
 //	the vector mentioned in brief description.
-func getSumConcurrencesOf(n uint, concurrences map[uint]map[uint]uint) []uint {
+func getSumConcurrencesOf(n uint, concurrences map[uint]map[uint]float64,
+) []float64 {
 	// -------------------------------------------------------------------------
 	// step 1:
-	sumConcurrencesOf := make([]uint, n)
+	sumConcurrencesOf := make([]float64, n)
 	for u := uint(0); u < n; u++ {
-		mySum := uint(0)
+		mySum := 0.0
 		weightsOfU, exists := concurrences[u]
 		if exists {
 			for _, weightUV := range weightsOfU {
@@ -163,18 +164,18 @@ func getSumConcurrencesOf(n uint, concurrences map[uint]map[uint]uint) []uint {
 // output:
 //	nothing.
 func (cm *ConcurrenceModel) SetConcurrences(n uint,
-	concurrence map[uint]map[uint]uint) {
+	concurrences map[uint]map[uint]float64) {
 	// -------------------------------------------------------------------------
 	// step 1: check whether the concurrences are valid.
-	verifyConcurrences(n, concurrence)
+	verifyConcurrences(n, concurrences)
 
 	// -------------------------------------------------------------------------
 	// step 2: get the nodewise sum of weights
-	sumConcurrencesOf := getSumConcurrencesOf(n, concurrence)
+	sumConcurrencesOf := getSumConcurrencesOf(n, concurrences)
 
 	// -------------------------------------------------------------------------
 	// step 3: compute the sum of all weights
-	sumConcurrences := uint(0)
+	sumConcurrences := 0.0
 	for _, value := range sumConcurrencesOf {
 		sumConcurrences += value
 	}
@@ -184,7 +185,7 @@ func (cm *ConcurrenceModel) SetConcurrences(n uint,
 	cm.n = n
 	cm.sumConcurrences = sumConcurrences
 	cm.sumConcurrencesOf = sumConcurrencesOf
-	cm.concurrences = concurrence
+	cm.concurrences = concurrences
 }
 
 // =============================================================================
@@ -200,12 +201,12 @@ func (cm ConcurrenceModel) GetN() uint {
 //	i: a point ID
 // output:
 //	the frequency of the concurrence of i if exists, 0 otherwise
-func (cm ConcurrenceModel) GetConcurrencesOf(i uint) map[uint]uint {
+func (cm ConcurrenceModel) GetConcurrencesOf(i uint) map[uint]float64 {
 	weightsOfI, exists := cm.concurrences[i]
 	if exists {
 		return weightsOfI
 	} else {
-		return map[uint]uint{}
+		return map[uint]float64{}
 	}
 }
 
@@ -217,12 +218,12 @@ func (cm ConcurrenceModel) GetConcurrencesOf(i uint) map[uint]uint {
 // output:
 //	the frequency of the concurrence between i and j if the edge exists, 0
 //	otherwise
-func (cm ConcurrenceModel) GetConcurrence(i, j uint) uint {
+func (cm ConcurrenceModel) GetConcurrence(i, j uint) float64 {
 	weightIJ, exists := cm.GetConcurrencesOf(i)[j]
 	if exists {
 		return weightIJ
 	} else {
-		return uint(0)
+		return 0.0
 	}
 }
 
@@ -285,9 +286,9 @@ func (cm ConcurrenceModel) Aggregate(communities []map[uint]bool,
 	// -------------------------------------------------------------------------
 	// step 1: set newN and create an empty newConcurrences
 	newN := uint(len(communities))
-	newConcurrences := map[uint]map[uint]uint{}
+	newConcurrences := map[uint]map[uint]float64{}
 	for i := uint(0); i < newN; i++ {
-		newConcurrences[i] = map[uint]uint{}
+		newConcurrences[i] = map[uint]float64{}
 	}
 
 	// -------------------------------------------------------------------------
@@ -296,7 +297,7 @@ func (cm ConcurrenceModel) Aggregate(communities []map[uint]bool,
 		c1 := communities[i1]
 		for i2 := i1 + 1; i2 < newN; i2++ {
 			c2 := communities[i2]
-			weightI1I2 := uint(0)
+			weightI1I2 := 0.0
 			for pt1, _ := range c1 {
 				weightsOfPt1, exists := cm.concurrences[pt1]
 				if !exists {
@@ -309,7 +310,7 @@ func (cm ConcurrenceModel) Aggregate(communities []map[uint]bool,
 					}
 				}
 			}
-			if weightI1I2 > uint(0) {
+			if weightI1I2 > 0.0 {
 				newConcurrences[i1][i2] = weightI1I2
 				newConcurrences[i2][i1] = weightI1I2
 			}
@@ -337,11 +338,11 @@ func (cm ConcurrenceModel) InduceSimilarities() map[uint]map[uint]float64 {
 	simMat := map[uint]map[uint]float64{}
 	for u := uint(0); u < cm.n; u++ {
 		row := map[uint]float64{u: 1.0}
-		cu := 0.5 / float64(cm.sumConcurrencesOf[u])
+		cu := 0.5 / cm.sumConcurrencesOf[u]
 		weightsOfU := cm.GetConcurrencesOf(u)
 		for v, weightUV := range weightsOfU {
-			cv := 0.5 / float64(cm.sumConcurrencesOf[v])
-			row[v] = float64(weightUV) * (cu + cv)
+			cv := 0.5 / cm.sumConcurrencesOf[v]
+			row[v] = weightUV * (cu + cv)
 		}
 		simMat[u] = row
 	}
@@ -356,7 +357,7 @@ func (cm ConcurrenceModel) InduceSimilarities() map[uint]map[uint]float64 {
 // output:
 //	true if it connects them, false otherwise
 func (cm ConcurrenceModel) Connects(u, v uint) bool {
-	return cm.GetConcurrence(u, v) > 0
+	return cm.GetConcurrence(u, v) > 0.0
 }
 
 // =============================================================================
@@ -390,7 +391,7 @@ func (cm ConcurrenceModel) ConnectsWell(subset, set map[uint]bool, r float64,
 		for v, _ := range complement {
 			weightUV, exists := weightsOfU[v]
 			if exists {
-				x += float64(weightUV)
+				x += weightUV
 			}
 		}
 	}
@@ -537,7 +538,7 @@ func (qm Modularity) DeltaQuality(communities []map[uint]bool,
 	for j := range newCommunityOfU {
 		weightUJ, exists := weightsOfU[j]
 		if !exists {
-			weightUJ = uint(0)
+			weightUJ = 0.0
 		}
 		kj := float64(qm.sumConcurrencesOf[j])
 		result += float64(weightUJ) - rOverM*ku*kj
@@ -551,7 +552,7 @@ func (qm Modularity) DeltaQuality(communities []map[uint]bool,
 		}
 		weightUJ, exists := weightsOfU[j]
 		if !exists {
-			weightUJ = uint(0)
+			weightUJ = 0.0
 		}
 		kj := float64(qm.sumConcurrencesOf[j])
 		result -= float64(weightUJ) - rOverM*ku*kj
