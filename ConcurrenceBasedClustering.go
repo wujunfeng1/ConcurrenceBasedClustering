@@ -52,6 +52,7 @@ package ConcurrenceBasedClustering
 import (
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"time"
 )
@@ -70,6 +71,8 @@ type ConcurrenceModel struct {
 	n                 uint
 	sumConcurrences   uint
 	sumConcurrencesOf []uint
+	meanConcurrenceOf []float64
+	varConcurrenceOf  []float64
 	concurrences      map[uint]map[uint]uint
 }
 
@@ -81,6 +84,8 @@ func NewConcurrenceModel() ConcurrenceModel {
 		n:                 0,
 		sumConcurrences:   0,
 		sumConcurrencesOf: []uint{},
+		meanConcurrenceOf: []float64{},
+		varConcurrenceOf:  []float64{},
 		concurrences:      map[uint]map[uint]uint{},
 	}
 }
@@ -179,10 +184,39 @@ func (cm *ConcurrenceModel) SetConcurrences(n uint,
 	}
 
 	// -------------------------------------------------------------------------
-	// step 4: set the fields
+	// step 4: compute the nodewise mean of weights
+	meanConcurrenceOf := make([]float64, n)
+	for u := uint(0); u < n; u++ {
+		if sumConcurrencesOf[u] == 0 {
+			meanConcurrenceOf[u] = 0.0
+		} else {
+			meanConcurrenceOf[u] = float64(sumConcurrencesOf[u]) / float64(len(concurrence[u]))
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 5: compute the nodewise variance of weights
+	varConcurrenceOf := make([]float64, n)
+	for u := uint(0); u < n; u++ {
+		if sumConcurrencesOf[u] == 0 {
+			varConcurrenceOf[u] = 0.0
+		} else {
+			varConcurrenceOf[u] = 0.0
+			for _, weightUV := range concurrence[u] {
+				diffFromMean := float64(weightUV) - meanConcurrenceOf[u]
+				varConcurrenceOf[u] += diffFromMean * diffFromMean
+			}
+			varConcurrenceOf[u] /= float64(len(concurrence[u]))
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 6: set the fields
 	cm.n = n
 	cm.sumConcurrences = sumConcurrences
 	cm.sumConcurrencesOf = sumConcurrencesOf
+	cm.meanConcurrenceOf = meanConcurrenceOf
+	cm.varConcurrenceOf = varConcurrenceOf
 	cm.concurrences = concurrence
 }
 
@@ -336,11 +370,202 @@ func (cm ConcurrenceModel) InduceSimilarities() map[uint]map[uint]float64 {
 	simMat := map[uint]map[uint]float64{}
 	for u := uint(0); u < cm.n; u++ {
 		row := map[uint]float64{u: 1.0}
-		cu := 0.5 / float64(cm.sumConcurrencesOf[u])
 		weightsOfU := cm.GetConcurrencesOf(u)
+		if len(weightsOfU) == 0 {
+			continue
+		}
+		cu := 0.5 / float64(cm.sumConcurrencesOf[u])
 		for v, weightUV := range weightsOfU {
 			cv := 0.5 / float64(cm.sumConcurrencesOf[v])
 			row[v] = float64(weightUV) * (cu + cv)
+		}
+		simMat[u] = row
+	}
+	return simMat
+}
+
+// =============================================================================
+// func (cm ConcurrenceModel) InduceNormalizedSimilarities
+// brief description: induce normalized similarities from concurrences.
+// input:
+//	nothing
+// output:
+//	A similarity matrix induced from concurrences.
+// note:
+//	A normalized similarity is 0.5 if the weight is the mean of concurrence,
+func (cm ConcurrenceModel) InduceNormalizedSimilarities() map[uint]map[uint]float64 {
+	simMat := map[uint]map[uint]float64{}
+	for u := uint(0); u < cm.n; u++ {
+		row := map[uint]float64{u: 1.0}
+		weightsOfU := cm.GetConcurrencesOf(u)
+		for v, weightUV := range weightsOfU {
+			normalizedWeightU := math.Erf((float64(weightUV) - cm.meanConcurrenceOf[u]) /
+				cm.varConcurrenceOf[u])
+			normalizedWeightV := math.Erf((float64(weightUV) - cm.meanConcurrenceOf[v]) /
+				cm.varConcurrenceOf[v])
+			row[v] = 0.5 * (normalizedWeightU + normalizedWeightV)
+		}
+		simMat[u] = row
+	}
+	return simMat
+}
+
+// =============================================================================
+// func (cm ConcurrenceModel) InduceJaccardSimilarities
+// brief description: compute the induced Jaccard Similarities from concurrences
+// input:
+//	nothing
+// output:
+//	A Jaccard similarity matrix induced from concurrences
+func (cm ConcurrenceModel) InduceJaccardSimilarities() map[uint]map[uint]float64 {
+	simMat := map[uint]map[uint]float64{}
+	for u := uint(0); u < cm.n; u++ {
+		row := map[uint]float64{u: 1.0}
+		weightsOfU := cm.GetConcurrencesOf(u)
+		for v, _ := range weightsOfU {
+			weightsOfV := cm.GetConcurrencesOf(v)
+
+			// compute the size of intersection of neighborU and neighborV
+			numInIntersection := 0
+			if len(weightsOfU) < len(weightsOfV) {
+				for neighborU, _ := range weightsOfU {
+					_, isNeighborV := weightsOfV[neighborU]
+					if isNeighborV {
+						numInIntersection++
+					}
+				}
+			} else {
+				for neighborV, _ := range weightsOfV {
+					_, isNeighborU := weightsOfU[neighborV]
+					if isNeighborU {
+						numInIntersection++
+					}
+				}
+			}
+
+			// skip if it is an empty intersection
+			if numInIntersection == 0 {
+				continue
+			}
+
+			// compute the size of union of neighborU and neighborV
+			numInUnion := len(weightsOfU) + len(weightsOfV) - numInIntersection
+
+			// compute the similarity of u and v
+			row[v] = float64(numInIntersection) / float64(numInUnion)
+		}
+		simMat[u] = row
+	}
+	return simMat
+}
+
+// =============================================================================
+// func (cm ConcurrenceModel) InduceWeightedJaccardSimilarities
+// brief description: compute the induced weighted Jaccard Similarities from
+//	concurrences
+// input:
+//	nothing
+// output:
+//	A weighted Jaccard similarity matrix induced from concurrences
+func (cm ConcurrenceModel) InduceWeightedJaccardSimilarities() map[uint]map[uint]float64 {
+	simMat := map[uint]map[uint]float64{}
+	for u := uint(0); u < cm.n; u++ {
+		row := map[uint]float64{u: 1.0}
+		weightsOfU := cm.GetConcurrencesOf(u)
+		if len(weightsOfU) == 0 {
+			continue
+		}
+		cu := 1.0 / float64(cm.sumConcurrencesOf[u])
+		for v, _ := range weightsOfU {
+			weightsOfV := cm.GetConcurrencesOf(v)
+			cv := 1.0 / float64(cm.sumConcurrencesOf[v])
+
+			// compute the weighted size of intersection of neighborU and neighborV
+			sumWeightInIntersection := 0.0
+			if len(weightsOfU) < len(weightsOfV) {
+				for neighborU, weightAtU := range weightsOfU {
+					weightAtV, isNeighborV := weightsOfV[neighborU]
+					if isNeighborV {
+						sumWeightInIntersection += float64(weightAtU*weightAtV) * cu * cv
+					}
+				}
+			} else {
+				for neighborV, weightAtV := range weightsOfV {
+					weightAtU, isNeighborU := weightsOfU[neighborV]
+					if isNeighborU {
+						sumWeightInIntersection += float64(weightAtU*weightAtV) * cu * cv
+					}
+				}
+			}
+
+			// compute the similarity of u and v
+			row[v] = sumWeightInIntersection
+		}
+		simMat[u] = row
+	}
+	return simMat
+}
+
+// =============================================================================
+// func (cm ConcurrenceModel) InduceNormalizedJaccardSimilarities
+// brief description: compute the induced weighted Jaccard Similarities from
+//	concurrences
+// input:
+//	nothing
+// output:
+//	A weighted Jaccard similarity matrix induced from concurrences
+func (cm ConcurrenceModel) InduceNormalizedJaccardSimilarities() map[uint]map[uint]float64 {
+	simMat := map[uint]map[uint]float64{}
+	sumNormalizedWeightsOf := make([]float64, cm.n)
+	for u := uint(0); u < cm.n; u++ {
+		sumNormalizedWeightsOf[u] = 0.0
+		weightsOfU := cm.GetConcurrencesOf(u)
+		for _, weight := range weightsOfU {
+			sumNormalizedWeightsOf[u] += math.Erf((float64(weight) - cm.meanConcurrenceOf[u]) /
+				cm.varConcurrenceOf[u])
+		}
+	}
+
+	for u := uint(0); u < cm.n; u++ {
+		row := map[uint]float64{u: 1.0}
+		weightsOfU := cm.GetConcurrencesOf(u)
+		if len(weightsOfU) == 0 {
+			continue
+		}
+		cu := 1.0 / sumNormalizedWeightsOf[u]
+		for v, _ := range weightsOfU {
+			weightsOfV := cm.GetConcurrencesOf(v)
+			cv := 1.0 / sumNormalizedWeightsOf[v]
+
+			// compute the weighted size of intersection of neighborU and neighborV
+			sumWeightInIntersection := 0.0
+			if len(weightsOfU) < len(weightsOfV) {
+				for neighborU, weightAtU := range weightsOfU {
+					weightAtV, isNeighborV := weightsOfV[neighborU]
+					if isNeighborV {
+						wu := cu * math.Erf((float64(weightAtU)-cm.meanConcurrenceOf[u])/
+							cm.varConcurrenceOf[u])
+						wv := cv * math.Erf((float64(weightAtV)-cm.meanConcurrenceOf[v])/
+							cm.varConcurrenceOf[v])
+						sumWeightInIntersection += wu * wv
+
+					}
+				}
+			} else {
+				for neighborV, weightAtV := range weightsOfV {
+					weightAtU, isNeighborU := weightsOfU[neighborV]
+					if isNeighborU {
+						wu := cu * math.Erf((float64(weightAtU)-cm.meanConcurrenceOf[u])/
+							cm.varConcurrenceOf[u])
+						wv := cv * math.Erf((float64(weightAtV)-cm.meanConcurrenceOf[v])/
+							cm.varConcurrenceOf[v])
+						sumWeightInIntersection += wu * wv
+					}
+				}
+			}
+
+			// compute the similarity of u and v
+			row[v] = sumWeightInIntersection
 		}
 		simMat[u] = row
 	}
@@ -791,7 +1016,7 @@ func getNeighbors(simMat map[uint]map[uint]float64, eps float64,
 			}
 			// find points that locate within pt's neighborhood
 			if similarity+eps >= 1.0 {
-				_, isCorePoint := corePts[pt]
+				_, isCorePoint := corePts[neighbor]
 				if isCorePoint {
 					coreRow[neighbor] = true
 				} else {
@@ -804,20 +1029,19 @@ func getNeighbors(simMat map[uint]map[uint]float64, eps float64,
 }
 
 // =============================================================================
-// func DBScan
+// func (cm ConcurrenceModel) DBScan
 // brief description: This is an implementation to the famous DBScan algorithm.
 // input:
-//	n: the number of nodes.
-//	concurrence: a matrix that its element (i,j) is the frequency of the concurrence
-//		between node i and node j. If no such concurrence exists, then the
-//		element is 0.
 //	eps: the radius of neighborhood.
 //	minPts: Only if the neighborhood of a point contains at least minPt points
 //		(the center point of the neighborhood included), the neighborhood is
 //		called dense. Only dense neighborhoods are connected to communities.
+//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
+//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
+//		normalized jaccard similarity
 // output:
 //	A list of clusters.
-func DBScan(cm ConcurrenceModel, eps float64, minPts uint) []map[uint]bool {
+func (cm ConcurrenceModel) DBScan(eps float64, minPts uint, simType int) []map[uint]bool {
 	// -------------------------------------------------------------------------
 	// step 1: initialize auxiliary data structures
 	communityIDs := map[uint]uint{}
@@ -825,7 +1049,20 @@ func DBScan(cm ConcurrenceModel, eps float64, minPts uint) []map[uint]bool {
 
 	// -------------------------------------------------------------------------
 	// step 2: build the similarity matrix
-	simMat := cm.InduceSimilarities()
+	simMat := map[uint]map[uint]float64{}
+	switch simType {
+	case 0:
+		simMat = cm.InduceSimilarities()
+	case 1:
+		simMat = cm.InduceNormalizedSimilarities()
+	case 2:
+		simMat = cm.InduceJaccardSimilarities()
+	case 3:
+		simMat = cm.InduceWeightedJaccardSimilarities()
+	case 4:
+		simMat = cm.InduceNormalizedJaccardSimilarities()
+	}
+
 	// -------------------------------------------------------------------------
 	// step 3: find all core points and their neighborhood densities
 	corePts := getCorePoints(simMat, eps, minPts)
@@ -877,6 +1114,11 @@ func DBScan(cm ConcurrenceModel, eps float64, minPts uint) []map[uint]bool {
 				bptNoncoreNeighbors, exists := noncoreNeighbors[bpt]
 				if exists {
 					for neighbor, _ := range bptNoncoreNeighbors {
+						// skip those already in a community
+						_, alreadyIn := communityIDs[neighbor]
+						if alreadyIn {
+							continue
+						}
 						newCommunity[neighbor] = true
 						communityIDs[neighbor] = c
 					}
@@ -886,13 +1128,14 @@ func DBScan(cm ConcurrenceModel, eps float64, minPts uint) []map[uint]bool {
 					continue
 				}
 				for neighbor, _ := range bptCoreNeighbors {
-					// skip those already in this community
-					_, alreadyIn := newCommunity[neighbor]
-					if !alreadyIn {
-						newBoundary[neighbor] = true
-						newCommunity[neighbor] = true
-						communityIDs[neighbor] = c
+					// skip those already in a community
+					_, alreadyIn := communityIDs[neighbor]
+					if alreadyIn {
+						continue
 					}
+					newBoundary[neighbor] = true
+					newCommunity[neighbor] = true
+					communityIDs[neighbor] = c
 				}
 			}
 			boundary = newBoundary
@@ -900,8 +1143,842 @@ func DBScan(cm ConcurrenceModel, eps float64, minPts uint) []map[uint]bool {
 	}
 
 	// -------------------------------------------------------------------------
-	// step 6: return the result
+	// step 6: add isolated points into the result
+	for pt, _ := range simMat {
+		_, exists := communityIDs[pt]
+		if !exists {
+			newCommunity := map[uint]bool{pt: true}
+			communities = append(communities, newCommunity)
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 7: return the result
 	return communities
+}
+
+// =============================================================================
+// struct UintPair
+type UintPair struct {
+	i, j uint
+}
+
+// =============================================================================
+// func NewUintPair
+func MakeUintPair(i, j uint) UintPair {
+	if i < j {
+		return UintPair{i: i, j: j}
+	} else {
+		return UintPair{i: j, j: i}
+	}
+}
+
+// =============================================================================
+// func sim
+func sim(simMat map[uint]map[uint]float64, i, j uint) float64 {
+	row, exists := simMat[i]
+	if !exists {
+		return 0.0
+	}
+	simIJ, exists := row[j]
+	if !exists {
+		return 0.0
+	}
+	return simIJ
+}
+
+// =============================================================================
+// func getPairSimilarities
+// brief description: compute pair similarities from item similarities
+// input:
+//	simMat: the item similarities
+// output:
+//	the pair similaritites
+func getPairSimilarities(simMat map[uint]map[uint]float64) map[UintPair]map[UintPair]float64 {
+	// -------------------------------------------------------------------------
+	// step 1: find all pairs and index them
+	n := uint(len(simMat))
+	pairs := map[UintPair]uint{}
+	for u := uint(0); u < n; u++ {
+		row, exists := simMat[u]
+		if !exists {
+			log.Fatal("Invalid similarity matrix")
+		}
+		for v, _ := range row {
+			// skip same item
+			if u == v {
+				continue
+			}
+
+			// skip those already in pairs
+			pair := MakeUintPair(u, v)
+			_, exists := pairs[pair]
+			if exists {
+				continue
+			}
+
+			// assign pair index
+			idxPair := uint(len(pairs))
+			pairs[pair] = idxPair
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 2: compute the pairwise similarities
+	pairSimMat := map[UintPair]map[UintPair]float64{}
+	for pair1, idxPair1 := range pairs {
+		row := map[UintPair]float64{pair1: 1.0}
+		pairSimMat[pair1] = row
+		for pair2, idxPair2 := range pairs {
+			// skip same pair
+			if idxPair1 == idxPair2 {
+				continue
+			}
+
+			// compute the similarity between these two pairs
+			simI1I2 := sim(simMat, pair1.i, pair2.i)
+			simI1J2 := sim(simMat, pair1.i, pair2.j)
+			simJ1I2 := sim(simMat, pair1.j, pair2.i)
+			simJ1J2 := sim(simMat, pair1.j, pair2.j)
+			simP1P2 := 0.25 * (simI1I2 + simI1J2 + simJ1I2 + simJ1J2)
+			if simP1P2 > 0.0 {
+				row[pair2] = simP1P2
+			}
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 2: return the pairwise similarities
+	return pairSimMat
+}
+
+// =============================================================================
+// func getCorePairs
+// brief description: This is part of an implementation to the pairwise DBScan
+//	algorithm: looking for all core points.
+// input:
+//	pairSimMat: the similarity matrix. It must be symmetric, all elements 0~1, and
+//		the diagonal elements are all 1.
+//	eps: the radius of neighborhood.
+//	minPts: Only if the neighborhood of a point contains at least minPt points
+//		(the center point of the neighborhood included), the neighborhood is
+//		called dense. Only dense neighborhoods are connected to communities.
+// output:
+//	A map of core pairs to their neighborhood densities.
+func getCorePairs(pairSimMat map[UintPair]map[UintPair]float64, eps float64,
+	minPts uint) map[UintPair]uint {
+	// -------------------------------------------------------------------------
+	// step 1: compute the densities of neighborhoods for all pairs
+	densities := map[UintPair]uint{}
+	for pair, row := range pairSimMat {
+		myDensity := uint(0)
+		for _, sim := range row {
+			if sim+eps >= 1.0 {
+				myDensity++
+			}
+		}
+		densities[pair] = myDensity
+	}
+
+	// -------------------------------------------------------------------------
+	// step 2: generate a list of points with dense neighborhoods
+	corePairs := map[UintPair]uint{}
+	for pair, density := range densities {
+		if density >= minPts {
+			corePairs[pair] = density
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 3: return the result
+	return corePairs
+}
+
+// =============================================================================
+// func getPairNeighbors
+// brief description: This is part of an implementation to the pairwise DBScan
+//	algorithm: generating a list of core members and another list of noncore
+//	neighbors for each core points.
+// input:
+//	pairSimMat: the similarity matrix. It must be symmetric, all elements 0~1, and
+//		the diagonal elements are all 1.
+//	eps: the radius of neighborhood.
+//	minPts: Only if the neighborhood of a point contains at least minPt points
+//		(the center point of the neighborhood included), the neighborhood is
+//		called dense. Only dense neighborhoods are connected to communities.
+//	corePts: a map of core points to their neighborhood densities.
+// output:
+//	output 1: a list of the core neighbors for each core point.
+//	output 2: a list of the noncore neighbors for each core point.
+func getPairNeighbors(pairSimMat map[UintPair]map[UintPair]float64, eps float64,
+	minPts uint, corePairs map[UintPair]uint) (map[UintPair]map[UintPair]bool,
+	map[UintPair]map[UintPair]bool) {
+	coreNeighbors := map[UintPair]map[UintPair]bool{}
+	noncoreNeighbors := map[UintPair]map[UintPair]bool{}
+	for pair, _ := range corePairs {
+		// create the rows of the results
+		coreRow := map[UintPair]bool{}
+		coreNeighbors[pair] = coreRow
+		noncoreRow := map[UintPair]bool{}
+		noncoreNeighbors[pair] = noncoreRow
+
+		// read the row of similarity matrix
+		simRow, rowExists := pairSimMat[pair]
+		if !rowExists {
+			log.Fatal("invalid similarity matrix")
+		}
+
+		// scan through the row we just read
+		for neighbor, similarity := range simRow {
+			// skip pt itself
+			if neighbor == pair {
+				continue
+			}
+			// find pairs that locate within pt's neighborhood
+			if similarity+eps >= 1.0 {
+				_, isCorePair := corePairs[neighbor]
+				if isCorePair {
+					coreRow[neighbor] = true
+				} else {
+					noncoreRow[neighbor] = true
+				}
+			}
+		}
+	}
+	return coreNeighbors, noncoreNeighbors
+}
+
+// =============================================================================
+// func (cm ConcurrenceModel) PairDBScan
+// brief description: This is an implementation to the famous DBScan algorithm.
+// input:
+//	eps: the radius of neighborhood.
+//	minPts: Only if the neighborhood of a point contains at least minPt points
+//		(the center point of the neighborhood included), the neighborhood is
+//		called dense. Only dense neighborhoods are connected to communities.
+//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
+//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
+//		normalized jaccard similarity
+// output:
+//	A list of clusters.
+func (cm ConcurrenceModel) PairDBScan(eps float64, minPts uint, simType int) []map[UintPair]bool {
+	// -------------------------------------------------------------------------
+	// step 1: initialize auxiliary data structures
+	communityIDs := map[UintPair]uint{}
+	communities := []map[UintPair]bool{}
+
+	// -------------------------------------------------------------------------
+	// step 2: build the similarity matrix
+	simMat := map[uint]map[uint]float64{}
+	switch simType {
+	case 0:
+		simMat = cm.InduceSimilarities()
+	case 1:
+		simMat = cm.InduceNormalizedSimilarities()
+	case 2:
+		simMat = cm.InduceJaccardSimilarities()
+	case 3:
+		simMat = cm.InduceWeightedJaccardSimilarities()
+	case 4:
+		simMat = cm.InduceNormalizedJaccardSimilarities()
+	}
+	pairSimMat := getPairSimilarities(simMat)
+
+	// -------------------------------------------------------------------------
+	// step 3: find all core pairs and their neighborhood densities
+	corePairs := getCorePairs(pairSimMat, eps, minPts)
+
+	// -------------------------------------------------------------------------
+	// step 4: find neighbors for each core point
+	coreNeighbors, noncoreNeighbors := getPairNeighbors(pairSimMat, eps, minPts, corePairs)
+
+	// -------------------------------------------------------------------------
+	// step 5: loop until all core pairs are in communities
+	pairN := MakeUintPair(cm.n, cm.n)
+	for {
+		// (5.1) prepare an ID for the new community
+		c := uint(len(communities))
+
+		// (5.2) find the densist unassigned core point as the center point of
+		// the new cluster
+		centerPair := pairN
+		centerDensity := uint(0)
+		for pair, density := range corePairs {
+			// skip those pairs that have already been assigned into community
+			_, exists := communityIDs[pair]
+			if exists {
+				continue
+			}
+
+			// check whether with the currently most dense neighborhood
+			if density > centerDensity {
+				centerPair = pair
+				centerDensity = density
+			}
+		}
+
+		// (5.3) stop the loop if not new centerPt is found
+		if centerDensity == uint(0) {
+			break
+		}
+
+		// (5.4) officially create the community
+		newCommunity := map[UintPair]bool{centerPair: true}
+		communities = append(communities, newCommunity)
+		communityIDs[centerPair] = c
+
+		// (5.5) iteratively append neighbors to the new community
+		boundary := map[UintPair]bool{centerPair: true}
+		for len(boundary) > 0 {
+			newBoundary := map[UintPair]bool{}
+			for bpp, _ := range boundary {
+				bppNoncoreNeighbors, exists := noncoreNeighbors[bpp]
+				if exists {
+					for neighbor, _ := range bppNoncoreNeighbors {
+						// skip those already in a community
+						_, alreadyIn := communityIDs[neighbor]
+						if alreadyIn {
+							continue
+						}
+						newCommunity[neighbor] = true
+						communityIDs[neighbor] = c
+					}
+				}
+				bppCoreNeighbors, exists := coreNeighbors[bpp]
+				if !exists {
+					continue
+				}
+				for neighbor, _ := range bppCoreNeighbors {
+					// skip those already in a community
+					_, alreadyIn := communityIDs[neighbor]
+					if alreadyIn {
+						continue
+					}
+
+					newBoundary[neighbor] = true
+					newCommunity[neighbor] = true
+					communityIDs[neighbor] = c
+				}
+			}
+			boundary = newBoundary
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 6: add isolated pairs into the result
+	for pair, _ := range pairSimMat {
+		_, exists := communityIDs[pair]
+		if !exists {
+			newCommunity := map[UintPair]bool{pair: true}
+			communities = append(communities, newCommunity)
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 7: return the result
+	return communities
+}
+
+// =============================================================================
+// func mergeClusters
+// brief description: a utility function to merge the clusters in UHC algorithm.
+// input:
+//	distMat: the distance matrix
+//	communities: the clusters
+//	eps: the radius of neighborhood
+// output:
+//	the merged communities
+func mergeClusters(distMat []map[uint]float64, communities []map[uint]bool, eps float64,
+) []map[uint]bool {
+	// -------------------------------------------------------------------------
+	// step 1: find min distance
+	minDist := 1.0
+	iMinDist := uint(0)
+	jMinDist := uint(0)
+	for i, row := range distMat {
+		for j, dist := range row {
+			if dist < minDist {
+				minDist = dist
+				iMinDist = uint(i)
+				jMinDist = j
+			}
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 2: stop recursion if min distance is > eps
+	if minDist > eps {
+		return communities
+	}
+
+	// -------------------------------------------------------------------------
+	// step 3: merge two clusters
+	if iMinDist > jMinDist {
+		iMinDist, jMinDist = jMinDist, iMinDist
+	}
+	newCommunities := make([]map[uint]bool, len(communities)-1)
+	for k := uint(0); k < uint(len(newCommunities)); k++ {
+		if k < iMinDist {
+			newCommunities[k] = communities[k]
+		} else if k == iMinDist {
+			ci := communities[iMinDist]
+			cj := communities[jMinDist]
+			ck := map[uint]bool{}
+			for u, _ := range ci {
+				ck[u] = true
+			}
+			for u, _ := range cj {
+				ck[u] = true
+			}
+			newCommunities[k] = ck
+		} else if k < jMinDist {
+			newCommunities[k] = communities[k]
+		} else {
+			newCommunities[k] = communities[k+1]
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 4: merge the distance matrix accordingly
+	newDistMat := make([]map[uint]float64, len(newCommunities))
+	for k := uint(0); k < uint(len(newCommunities)); k++ {
+		newRow := map[uint]float64{}
+		newDistMat[k] = newRow
+
+		oldK := k
+		if k >= jMinDist {
+			oldK++
+		}
+		oldRow := distMat[oldK]
+		for l, dist := range oldRow {
+			if l < iMinDist {
+				newRow[l] = dist
+			} else if l == iMinDist {
+				distJ, exists := oldRow[jMinDist]
+				if exists {
+					newRow[l] = math.Min(dist, distJ)
+				} else {
+					newRow[l] = dist
+				}
+			} else if l < jMinDist {
+				newRow[l] = dist
+			} else if l > jMinDist {
+				newRow[l-1] = dist
+			}
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 5: return the recursive merge result
+	return mergeClusters(newDistMat, newCommunities, eps)
+}
+
+// =============================================================================
+// func (cm ConcurrenceModel) AHC
+// brief description: This is the implementation to agglomerative hierarchical clustering
+// input:
+//	eps: the radius of neighborhood.
+//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
+//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
+//		normalized jaccard similarity
+// output:
+//	A list of clusters.
+func (cm ConcurrenceModel) AHC(eps float64, simType int) []map[uint]bool {
+	// -------------------------------------------------------------------------
+	// step 1: initialize auxiliary data structures
+	communityIDs := make([]uint, cm.n)
+	communities := []map[uint]bool{}
+	for u, _ := range cm.concurrences {
+		communityIDs[u] = uint(len(communities))
+		communities = append(communities, map[uint]bool{u: true})
+	}
+
+	// -------------------------------------------------------------------------
+	// step 2: build the similarity matrix
+	simMat := map[uint]map[uint]float64{}
+	switch simType {
+	case 0:
+		simMat = cm.InduceSimilarities()
+	case 1:
+		simMat = cm.InduceNormalizedSimilarities()
+	case 2:
+		simMat = cm.InduceJaccardSimilarities()
+	case 3:
+		simMat = cm.InduceWeightedJaccardSimilarities()
+	case 4:
+		simMat = cm.InduceNormalizedJaccardSimilarities()
+	}
+
+	// -------------------------------------------------------------------------
+	// step 3: build clusterwise distance matrix
+	distMat := make([]map[uint]float64, len(communities))
+	for u, weightsOfU := range cm.concurrences {
+		row := map[uint]float64{}
+		iu := communityIDs[u]
+		distMat[iu] = row
+		for v, _ := range weightsOfU {
+			if u == v {
+				continue
+			}
+			iv := communityIDs[v]
+			row[iv] = 1.0 - simMat[u][v]
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 3: recursively merge clusters
+	return mergeClusters(distMat, communities, eps)
+
+}
+
+// =============================================================================
+// func (cm ConcurrenceModel) PairAHC
+// brief description: This is the implementation to agglomerative hierarchical clustering
+// input:
+//	eps: the radius of neighborhood.
+//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
+//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
+//		normalized jaccard similarity
+// output:
+//	A list of clusters.
+func (cm ConcurrenceModel) PairAHC(eps float64, simType int) []map[UintPair]bool {
+	// -------------------------------------------------------------------------
+	// step 1: create auxiliary data structures
+	communityIDs := map[UintPair]uint{}
+	idToPair := map[uint]UintPair{}
+	communities := []map[UintPair]bool{}
+
+	// -------------------------------------------------------------------------
+	// step 2: build the similarity matrix
+	simMat := map[uint]map[uint]float64{}
+	switch simType {
+	case 0:
+		simMat = cm.InduceSimilarities()
+	case 1:
+		simMat = cm.InduceNormalizedSimilarities()
+	case 2:
+		simMat = cm.InduceJaccardSimilarities()
+	case 3:
+		simMat = cm.InduceWeightedJaccardSimilarities()
+	case 4:
+		simMat = cm.InduceNormalizedJaccardSimilarities()
+	}
+	pairSimMat := getPairSimilarities(simMat)
+
+	// -------------------------------------------------------------------------
+	// step 3: initialize auxiliary data structures
+	flattenSimMat := map[uint]map[uint]float64{}
+	flattenCommunities := []map[uint]bool{}
+	for pair, _ := range pairSimMat {
+		idxPair := uint(len(communityIDs))
+		communityIDs[pair] = idxPair
+		idToPair[idxPair] = pair
+		flattenCommunities = append(flattenCommunities, map[uint]bool{idxPair: true})
+		flattenSimMat[idxPair] = map[uint]float64{}
+	}
+	for pair, pairRow := range pairSimMat {
+		idxPair, _ := communityIDs[pair]
+		flattenRow, _ := flattenSimMat[idxPair]
+		for neighbor, sim := range pairRow {
+			idxNeighbor, _ := communityIDs[neighbor]
+			flattenRow[idxNeighbor] = sim
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 3: build clusterwise distance matrix
+	distMat := make([]map[uint]float64, len(flattenSimMat))
+	for u, rowOfU := range flattenSimMat {
+		row := map[uint]float64{}
+		distMat[u] = row
+		for v, sim := range rowOfU {
+			if u == v {
+				continue
+			}
+			row[v] = 1.0 - sim
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 3: recursively merge clusters
+	flattenCommunities = mergeClusters(distMat, flattenCommunities, eps)
+
+	// -------------------------------------------------------------------------
+	// step 4: convert flatten communities to communities
+	for _, flattenC := range flattenCommunities {
+		c := map[UintPair]bool{}
+		for idxPair, _ := range flattenC {
+			pair := idToPair[idxPair]
+			c[pair] = true
+		}
+		communities = append(communities, c)
+	}
+
+	// -------------------------------------------------------------------------
+	// step 5: return the result
+	return communities
+}
+
+// =============================================================================
+// func getGroupPairSimilarities
+// brief description: get group similarities from pair similarities
+// input:
+//	groups: a list of groups of items
+//	pairSimMat: the pairwise similarity mat
+// output:
+//	the group similarities
+func getGroupPairSimilarities(groups []map[uint]bool,
+	pairSimMat map[UintPair]map[UintPair]float64) map[uint]map[uint]float64 {
+	// -------------------------------------------------------------------------
+	// step 1: convert groups to pair representation
+	numGroups := uint(len(groups))
+	pairsOfGroups := make([]map[UintPair]bool, numGroups)
+	for idxGroup, group := range groups {
+		pairs := map[UintPair]bool{}
+		for i, _ := range group {
+			for j, _ := range group {
+				if i < j {
+					pairs[MakeUintPair(i, j)] = true
+				}
+			}
+		}
+		pairsOfGroups[idxGroup] = pairs
+	}
+
+	// ------------------------------------------------------------------------
+	// step 2: compute the result
+	result := map[uint]map[uint]float64{}
+	for i := uint(0); i < numGroups; i++ {
+		rowOfResult := map[uint]float64{i: 1.0}
+		result[i] = rowOfResult
+	}
+	for i := uint(0); i < numGroups; i++ {
+		pairsOfI := pairsOfGroups[i]
+		for j := uint(0); j < numGroups; j++ {
+			if i < j {
+				pairsOfJ := pairsOfGroups[j]
+				simIJ := 0.0
+				for pairI, _ := range pairsOfI {
+					simRowOfI, exists := pairSimMat[pairI]
+					if !exists {
+						continue
+					}
+					for pairJ, _ := range pairsOfJ {
+						sim, exists := simRowOfI[pairJ]
+						if !exists {
+							continue
+						}
+						simIJ += sim
+					}
+				}
+				if simIJ == 0.0 {
+					continue
+				}
+				simIJ /= float64(len(pairsOfI) * len(pairsOfJ))
+				result[i][j] = simIJ
+				result[j][i] = simIJ
+			}
+		}
+	}
+
+	// ------------------------------------------------------------------------
+	// step 3: return the result
+	return result
+}
+
+// =============================================================================
+// func (cm ConcurrenceModel) GroupPairDBScan
+// brief description: This is an implementation to the famous DBScan algorithm.
+// input:
+//	groups: a list of groups
+//	eps: the radius of neighborhood.
+//	minPts: Only if the neighborhood of a point contains at least minPt points
+//		(the center point of the neighborhood included), the neighborhood is
+//		called dense. Only dense neighborhoods are connected to communities.
+//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
+//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
+//		normalized jaccard similarity
+// output:
+//	A list of clusters.
+func (cm ConcurrenceModel) GroupPairDBScan(groups []map[uint]bool, eps float64, minPts uint,
+	simType int) []map[uint]bool {
+	// -------------------------------------------------------------------------
+	// step 1: initialize auxiliary data structures
+	communityIDs := map[uint]uint{}
+	communities := []map[uint]bool{}
+
+	// -------------------------------------------------------------------------
+	// step 2: build the similarity matrix
+	simMat := map[uint]map[uint]float64{}
+	switch simType {
+	case 0:
+		simMat = cm.InduceSimilarities()
+	case 1:
+		simMat = cm.InduceNormalizedSimilarities()
+	case 2:
+		simMat = cm.InduceJaccardSimilarities()
+	case 3:
+		simMat = cm.InduceWeightedJaccardSimilarities()
+	case 4:
+		simMat = cm.InduceNormalizedJaccardSimilarities()
+	}
+	pairSimMat := getPairSimilarities(simMat)
+	groupSimMat := getGroupPairSimilarities(groups, pairSimMat)
+
+	// -------------------------------------------------------------------------
+	// step 3: find all core points and their neighborhood densities
+	coreGroups := getCorePoints(groupSimMat, eps, minPts)
+
+	// -------------------------------------------------------------------------
+	// step 4: find neighbors for each core group
+	coreNeighbors, noncoreNeighbors := getNeighbors(groupSimMat, eps, minPts, coreGroups)
+
+	// -------------------------------------------------------------------------
+	// step 5: loop until all core groups are in communities
+	n := uint(len(groups))
+	for {
+		// (5.1) prepare an ID for the new community
+		c := uint(len(communities))
+
+		// (5.2) find the densist unassigned core group as the center group of
+		// the new cluster
+		centerGroup := n
+		centerDensity := uint(0)
+		for groupID, density := range coreGroups {
+			// skip those groups that have already been assigned into community
+			_, exists := communityIDs[groupID]
+			if exists {
+				continue
+			}
+
+			// check whether with the currently most dense neighborhood
+			if density > centerDensity {
+				centerGroup = groupID
+				centerDensity = density
+			}
+		}
+
+		// (5.3) stop the loop if not new centerPt is found
+		if centerGroup == n {
+			break
+		}
+
+		// (5.4) officially create the community
+		newCommunity := map[uint]bool{centerGroup: true}
+		communities = append(communities, newCommunity)
+		communityIDs[centerGroup] = c
+
+		// (5.5) iteratively append neighbors to the new community
+		boundary := map[uint]bool{centerGroup: true}
+		for len(boundary) > 0 {
+			newBoundary := map[uint]bool{}
+			for bpg, _ := range boundary {
+				bpgNoncoreNeighbors, exists := noncoreNeighbors[bpg]
+				if exists {
+					for neighbor, _ := range bpgNoncoreNeighbors {
+						// skip those already in a community
+						_, alreadyIn := communityIDs[neighbor]
+						if alreadyIn {
+							continue
+						}
+						newCommunity[neighbor] = true
+						communityIDs[neighbor] = c
+					}
+				}
+				bpgCoreNeighbors, exists := coreNeighbors[bpg]
+				if !exists {
+					continue
+				}
+				for neighbor, _ := range bpgCoreNeighbors {
+					// skip those already in a community
+					_, alreadyIn := communityIDs[neighbor]
+					if alreadyIn {
+						continue
+					}
+					newBoundary[neighbor] = true
+					newCommunity[neighbor] = true
+					communityIDs[neighbor] = c
+				}
+			}
+			boundary = newBoundary
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 6: add isolated points into the result
+	for groupID, _ := range groupSimMat {
+		_, exists := communityIDs[groupID]
+		if !exists {
+			newCommunity := map[uint]bool{groupID: true}
+			communities = append(communities, newCommunity)
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 7: return the result
+	return communities
+}
+
+// =============================================================================
+// func (cm ConcurrenceModel) GroupPairAHC
+// brief description: This is the implementation to agglomerative hierarchical clustering
+// input:
+//	groups: a list of groups
+//	eps: the radius of neighborhood.
+//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
+//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
+//		normalized jaccard similarity
+// output:
+//	A list of clusters.
+func (cm ConcurrenceModel) GroupPairAHC(groups []map[uint]bool, eps float64, simType int) []map[uint]bool {
+	// -------------------------------------------------------------------------
+	// step 1: initialize auxiliary data structures
+	n := uint(len(groups))
+	communityIDs := make([]uint, cm.n)
+	communities := []map[uint]bool{}
+	for u := uint(0); u < n; u++ {
+		communityIDs[u] = u
+		communities = append(communities, map[uint]bool{u: true})
+	}
+
+	// -------------------------------------------------------------------------
+	// step 2: build the similarity matrix
+	simMat := map[uint]map[uint]float64{}
+	switch simType {
+	case 0:
+		simMat = cm.InduceSimilarities()
+	case 1:
+		simMat = cm.InduceNormalizedSimilarities()
+	case 2:
+		simMat = cm.InduceJaccardSimilarities()
+	case 3:
+		simMat = cm.InduceWeightedJaccardSimilarities()
+	case 4:
+		simMat = cm.InduceNormalizedJaccardSimilarities()
+	}
+	pairSimMat := getPairSimilarities(simMat)
+	groupSimMat := getGroupPairSimilarities(groups, pairSimMat)
+
+	// -------------------------------------------------------------------------
+	// step 3: build clusterwise distance matrix
+	distMat := make([]map[uint]float64, len(communities))
+	for u, rowsOfU := range groupSimMat {
+		row := map[uint]float64{}
+		iu := communityIDs[u]
+		distMat[iu] = row
+		for v, sim := range rowsOfU {
+			if u == v {
+				continue
+			}
+			iv := communityIDs[v]
+			row[iv] = 1.0 - sim
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// step 3: recursively merge clusters
+	return mergeClusters(distMat, communities, eps)
+
 }
 
 // =============================================================================
