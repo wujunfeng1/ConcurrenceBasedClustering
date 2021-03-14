@@ -47,13 +47,21 @@ package ConcurrenceBasedClustering
 //		single-link cluster method. The computer journal, 16(1), 30-34.
 //	[CLINK] Defays, D. (1977). An efficient algorithm for a complete link method
 //		. The Computer Journal, 20(4), 364-366.
+//	[WPDM] Yang, S., Huang, G., & Ofoghi, B. (2019, May). Short Text Similarity
+//		Measurement Using Context from Bag of Word Pairs and Word Co-occurrence.
+//		In International Conference on Data Service (pp. 221-231). Springer,
+//		Singapore.
 // =============================================================================
 
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"math"
 	"math/rand"
+	"os"
+	"runtime"
+	"sort"
 	"time"
 )
 
@@ -68,12 +76,30 @@ func init() {
 // struct ConcurrenceModel
 // brief description: This is a struct for concurrence models
 type ConcurrenceModel struct {
-	n                 uint
+	// ------------------------------------------------------------------------
+	// basic fields:
+	n            uint
+	concurrences map[uint]map[uint]float64
+
+	// ------------------------------------------------------------------------
+	// statistical fields
 	sumConcurrences   float64
 	sumConcurrencesOf []float64
 	meanConcurrenceOf []float64
 	varConcurrenceOf  []float64
-	concurrences      map[uint]map[uint]float64
+
+	// ------------------------------------------------------------------------
+	// thresholds for pair selection sparsity
+	//	balanceThreshold: a threshold in (0, 1) to filter pairs by nodewise freq
+	//		balance.
+	//	concurrenceThreshold: a threshold > 0.0 to filter pairs by edgewise freq.
+	balanceThreshold     float64
+	concurrenceThreshold float64
+
+	// ------------------------------------------------------------------------
+	// the selected pairs
+	pairs    map[UintPair]uint
+	numPairs uint
 }
 
 // =============================================================================
@@ -81,12 +107,14 @@ type ConcurrenceModel struct {
 // brief description: create a new ConcurrenceModel object
 func NewConcurrenceModel() ConcurrenceModel {
 	return ConcurrenceModel{
-		n:                 0,
-		sumConcurrences:   0.0,
-		sumConcurrencesOf: []float64{},
-		meanConcurrenceOf: []float64{},
-		varConcurrenceOf:  []float64{},
-		concurrences:      map[uint]map[uint]float64{},
+		n:                    0,
+		concurrences:         map[uint]map[uint]float64{},
+		sumConcurrences:      0.0,
+		sumConcurrencesOf:    []float64{},
+		meanConcurrenceOf:    []float64{},
+		varConcurrenceOf:     []float64{},
+		balanceThreshold:     0.1,
+		concurrenceThreshold: 5.0,
 	}
 }
 
@@ -158,6 +186,29 @@ func getSumConcurrencesOf(n uint, concurrences map[uint]map[uint]float64,
 }
 
 // =============================================================================
+// func (cm *ConcurrenceModel) SetPairFilter
+// brief description: set the thresholds to filter pair selections to ensure
+//	pair sparsity.
+// input:
+//	balanceThreshold: a threshold in (0, 1) to filter pairs by nodewise freq
+//		balance.
+//	concurrenceThreshold: a threshold > 0.0 to filter pairs by edgewise freq.
+// output:
+//	nothing.
+func (cm *ConcurrenceModel) SetPairFilter(balanceThreshold float64,
+	concurrenceThreshold float64) {
+	if balanceThreshold <= 0.0 || balanceThreshold >= 1.0 {
+		log.Fatalln("balanceThreshold must be in (0,1).")
+	}
+	if concurrenceThreshold <= 0.0 {
+		log.Fatalln("concurrenceThreshold must be > 0.")
+	}
+	cm.balanceThreshold = balanceThreshold
+	cm.concurrenceThreshold = concurrenceThreshold
+	cm.filterPairs()
+}
+
+// =============================================================================
 // func (cm *ConcurrenceModel) SetConcurrences
 // brief description: set the concurrences of cm
 // input:
@@ -219,6 +270,10 @@ func (cm *ConcurrenceModel) SetConcurrences(n uint,
 	cm.meanConcurrenceOf = meanConcurrenceOf
 	cm.varConcurrenceOf = varConcurrenceOf
 	cm.concurrences = concurrences
+
+	// -------------------------------------------------------------------------
+	// step 7: filter the pairs
+	cm.filterPairs()
 }
 
 // =============================================================================
@@ -1188,21 +1243,22 @@ func sim(simMat map[uint]map[uint]float64, i, j uint) float64 {
 }
 
 // =============================================================================
-// func getPairSimilarities
-// brief description: compute pair similarities from item similarities
+// func (cm ConcurrenceModel) filterPairs
+// brief description: select pairs according to the thresholds.
 // input:
-//	simMat: the item similarities
+//	nothing
 // output:
-//	the pair similaritites
-func getPairSimilarities(simMat map[uint]map[uint]float64) map[UintPair]map[UintPair]float64 {
-	// -------------------------------------------------------------------------
-	// step 1: find all pairs and index them
-	n := uint(len(simMat))
+//	nothing
+// note:
+//	The method of ConcurrenceModel is implemented due to the large memory
+//	consumption of getPairSimilarities. See the notes of getPairSimilarities
+//	for more detail.
+func (cm *ConcurrenceModel) filterPairs() {
 	pairs := map[UintPair]uint{}
-	for u := uint(0); u < n; u++ {
-		row, exists := simMat[u]
+	for u := uint(0); u < cm.n; u++ {
+		row, exists := cm.concurrences[u]
 		if !exists {
-			log.Fatal("Invalid similarity matrix")
+			continue
 		}
 		for v, _ := range row {
 			// skip same item
@@ -1217,35 +1273,151 @@ func getPairSimilarities(simMat map[uint]map[uint]float64) map[UintPair]map[Uint
 				continue
 			}
 
+			// skip those don't satisfy the balance threshold
+			freqU := cm.sumConcurrencesOf[u]
+			freqV := cm.sumConcurrencesOf[v]
+			if freqU < cm.balanceThreshold*freqV || freqV < cm.balanceThreshold*freqU {
+				continue
+			}
+
+			// skip those don't satisfy the concurrence threshold
+			if cm.GetConcurrence(u, v) < cm.concurrenceThreshold {
+				continue
+			}
+
 			// assign pair index
 			idxPair := uint(len(pairs))
 			pairs[pair] = idxPair
 		}
 	}
+	cm.pairs = pairs
+	cm.numPairs = uint(len(pairs))
+}
 
-	// -------------------------------------------------------------------------
-	// step 2: compute the pairwise similarities
-	pairSimMat := map[UintPair]map[UintPair]float64{}
-	for pair1, idxPair1 := range pairs {
-		row := map[UintPair]float64{pair1: 1.0}
-		pairSimMat[pair1] = row
-		for pair2, idxPair2 := range pairs {
-			// skip same pair
-			if idxPair1 == idxPair2 {
+// =============================================================================
+// struct PairSimMat
+// brief description: a pseudo matrix that could save a lot of memory from computing
+// 	the real pairwise similarity matrix.
+type PairSimMat struct {
+	pairs    map[UintPair]uint
+	numPairs uint
+	simMat   map[uint]map[uint]float64
+}
+
+// =============================================================================
+// struct PairSimVec
+type PairSimVec struct {
+	pair UintPair
+	data map[UintPair]float64
+}
+
+// =============================================================================
+// func (psm PairSimMat) GetRow
+// brief description: get a row of a pairwise similarity matrix.
+// input:
+//	pair1: the pair1 indexing the row
+//	idxPair1: the index of pair1
+// output:
+//	a channel that yields the rows.
+func (psm PairSimMat) GetRow(pair1 UintPair, idxPair1 uint) map[UintPair]float64 {
+	row := map[UintPair]float64{pair1: 1.0}
+	rowI1, exists := psm.simMat[pair1.i]
+	if !exists {
+		rowI1 = map[uint]float64{}
+	}
+	rowJ1, exists := psm.simMat[pair1.j]
+	if !exists {
+		rowJ1 = map[uint]float64{}
+	}
+	union1 := map[uint]bool{}
+	union2 := map[uint]bool{}
+	for col, _ := range rowI1 {
+		union1[col] = true
+		union2[col] = true
+	}
+	for col, _ := range rowJ1 {
+		union1[col] = true
+		union2[col] = true
+	}
+	for item1, _ := range union1 {
+		delete(union2, item1)
+		for item2, _ := range union2 {
+			pair2 := MakeUintPair(item1, item2)
+			idxPair2, exists := psm.pairs[pair2]
+			if !exists || idxPair1 == idxPair2 {
 				continue
 			}
-
 			// compute the similarity between these two pairs
-			simI1I2 := sim(simMat, pair1.i, pair2.i)
-			simI1J2 := sim(simMat, pair1.i, pair2.j)
-			simJ1I2 := sim(simMat, pair1.j, pair2.i)
-			simJ1J2 := sim(simMat, pair1.j, pair2.j)
+			simI1I2 := sim(psm.simMat, pair1.i, pair2.i)
+			simI1J2 := sim(psm.simMat, pair1.i, pair2.j)
+			simJ1I2 := sim(psm.simMat, pair1.j, pair2.i)
+			simJ1J2 := sim(psm.simMat, pair1.j, pair2.j)
 			simP1P2 := 0.25 * (simI1I2 + simI1J2 + simJ1I2 + simJ1J2)
 			if simP1P2 > 0.0 {
 				row[pair2] = simP1P2
 			}
 		}
 	}
+	return row
+}
+
+// =============================================================================
+// func (psm PairSimMat) GetRows
+// brief description: iterates through the rows of a pairwise similarity matrix.
+// input:
+//	nothing
+// output:
+//	a channel that yields the rows.
+func (psm PairSimMat) GetRows() chan PairSimVec {
+	// -------------------------------------------------------------------------
+	// step 1: create a channel for the results
+	results := make(chan PairSimVec)
+
+	// -------------------------------------------------------------------------
+	// step 2: call a groroutine that yields the results
+	go func() {
+		for pair1, idxPair1 := range psm.pairs {
+			results <- PairSimVec{pair: pair1, data: psm.GetRow(pair1, idxPair1)}
+		}
+		close(results)
+	}()
+
+	// -------------------------------------------------------------------------
+	// step 3: return the result channel
+	return results
+}
+
+// =============================================================================
+// func (cm ConcurrenceModel) getPairSimilarities
+// brief description: compute pair similarities from item similarities
+// input:
+//	simMat: the item similarities
+// output:
+//	the pair similaritites
+// note:
+//	The initial implementation of this function is too memory consuming. To reduce
+//	the memory consumption, we must keep the pairwise similarity matrix with smaller
+//	size and higher sparsity. To do so, the pairs must be selected by thresholds.
+//	The selection is relied on a method from the following reference:
+//
+//	Yang, S., Huang, G., & Cai, B. (2019). Discovering topic representative terms for
+//	short text clustering. IEEE Access, 7, 92037-92047.
+//
+//	Therefore, we must first convert this function to a method of ConcurrenceModel,
+//	so that we could use its sumConcurrencesOf and concurrences to filter the pairs.
+//	More specifically, we use cm.balanceThreshold to filter the pairs by nodewise
+//	frequency balance, and use cm.concurrenceThreshold to filter the pairs by
+//	edgewise frequency.
+func (cm ConcurrenceModel) getPairSimilarities(simMat map[uint]map[uint]float64,
+) PairSimMat {
+	// -------------------------------------------------------------------------
+	// step 1: find all pairs and index them
+	pairs := cm.pairs
+	log.Printf("number of pairs = %d\n", len(pairs))
+
+	// -------------------------------------------------------------------------
+	// step 2: create the pairwise similarities matrix
+	pairSimMat := PairSimMat{pairs: cm.pairs, numPairs: cm.numPairs, simMat: simMat}
 
 	// -------------------------------------------------------------------------
 	// step 2: return the pairwise similarities
@@ -1265,12 +1437,13 @@ func getPairSimilarities(simMat map[uint]map[uint]float64) map[UintPair]map[Uint
 //		called dense. Only dense neighborhoods are connected to communities.
 // output:
 //	A map of core pairs to their neighborhood densities.
-func getCorePairs(pairSimMat map[UintPair]map[UintPair]float64, eps float64,
-	minPts uint) map[UintPair]uint {
+func getCorePairs(pairSimMat PairSimMat, eps float64, minPts uint) map[UintPair]uint {
 	// -------------------------------------------------------------------------
 	// step 1: compute the densities of neighborhoods for all pairs
 	densities := map[UintPair]uint{}
-	for pair, row := range pairSimMat {
+	for pairSimVec := range pairSimMat.GetRows() {
+		pair := pairSimVec.pair
+		row := pairSimVec.data
 		myDensity := uint(0)
 		for _, sim := range row {
 			if sim+eps >= 1.0 {
@@ -1300,6 +1473,7 @@ func getCorePairs(pairSimMat map[UintPair]map[UintPair]float64, eps float64,
 //	algorithm: generating a list of core members and another list of noncore
 //	neighbors for each core points.
 // input:
+//	pair: the pair indexing a row of pairSimMat
 //	pairSimMat: the similarity matrix. It must be symmetric, all elements 0~1, and
 //		the diagonal elements are all 1.
 //	eps: the radius of neighborhood.
@@ -1310,38 +1484,31 @@ func getCorePairs(pairSimMat map[UintPair]map[UintPair]float64, eps float64,
 // output:
 //	output 1: a list of the core neighbors for each core point.
 //	output 2: a list of the noncore neighbors for each core point.
-func getPairNeighbors(pairSimMat map[UintPair]map[UintPair]float64, eps float64,
-	minPts uint, corePairs map[UintPair]uint) (map[UintPair]map[UintPair]bool,
-	map[UintPair]map[UintPair]bool) {
-	coreNeighbors := map[UintPair]map[UintPair]bool{}
-	noncoreNeighbors := map[UintPair]map[UintPair]bool{}
-	for pair, _ := range corePairs {
-		// create the rows of the results
-		coreRow := map[UintPair]bool{}
-		coreNeighbors[pair] = coreRow
-		noncoreRow := map[UintPair]bool{}
-		noncoreNeighbors[pair] = noncoreRow
+func getPairNeighbors(pair UintPair, pairSimMat PairSimMat, eps float64, minPts uint,
+	corePairs map[UintPair]uint) (map[UintPair]bool, map[UintPair]bool) {
+	coreNeighbors := map[UintPair]bool{}
+	noncoreNeighbors := map[UintPair]bool{}
 
-		// read the row of similarity matrix
-		simRow, rowExists := pairSimMat[pair]
-		if !rowExists {
-			log.Fatal("invalid similarity matrix")
+	// read the row of similarity matrix
+	idxPair, exists := pairSimMat.pairs[pair]
+	if !exists {
+		log.Fatal("invalid pair in getPairNeighbors")
+	}
+	simRow := pairSimMat.GetRow(pair, idxPair)
+
+	// scan through the row we just read
+	for neighbor, similarity := range simRow {
+		// skip pt itself
+		if neighbor == pair {
+			continue
 		}
-
-		// scan through the row we just read
-		for neighbor, similarity := range simRow {
-			// skip pt itself
-			if neighbor == pair {
-				continue
-			}
-			// find pairs that locate within pt's neighborhood
-			if similarity+eps >= 1.0 {
-				_, isCorePair := corePairs[neighbor]
-				if isCorePair {
-					coreRow[neighbor] = true
-				} else {
-					noncoreRow[neighbor] = true
-				}
+		// find pairs that locate within pt's neighborhood
+		if similarity+eps >= 1.0 {
+			_, isCorePair := corePairs[neighbor]
+			if isCorePair {
+				coreNeighbors[neighbor] = true
+			} else {
+				noncoreNeighbors[neighbor] = true
 			}
 		}
 	}
@@ -1361,6 +1528,9 @@ func getPairNeighbors(pairSimMat map[UintPair]map[UintPair]float64, eps float64,
 //		normalized jaccard similarity
 // output:
 //	A list of clusters.
+// note:
+//	The algorithm of this function is inspired by WPDM. The reference of WPDM could
+//	be found at the beginning of this source file.
 func (cm ConcurrenceModel) PairDBScan(eps float64, minPts uint, simType int) []map[UintPair]bool {
 	// -------------------------------------------------------------------------
 	// step 1: initialize auxiliary data structures
@@ -1382,7 +1552,7 @@ func (cm ConcurrenceModel) PairDBScan(eps float64, minPts uint, simType int) []m
 	case 4:
 		simMat = cm.InduceNormalizedJaccardSimilarities()
 	}
-	pairSimMat := getPairSimilarities(simMat)
+	pairSimMat := cm.getPairSimilarities(simMat)
 
 	// -------------------------------------------------------------------------
 	// step 3: find all core pairs and their neighborhood densities
@@ -1390,16 +1560,16 @@ func (cm ConcurrenceModel) PairDBScan(eps float64, minPts uint, simType int) []m
 
 	// -------------------------------------------------------------------------
 	// step 4: find neighbors for each core point
-	coreNeighbors, noncoreNeighbors := getPairNeighbors(pairSimMat, eps, minPts, corePairs)
+	//coreNeighbors, noncoreNeighbors := getPairNeighbors(pairSimMat, eps, minPts, corePairs)
 
 	// -------------------------------------------------------------------------
-	// step 5: loop until all core pairs are in communities
+	// step 4: loop until all core pairs are in communities
 	pairN := MakeUintPair(cm.n, cm.n)
 	for {
-		// (5.1) prepare an ID for the new community
+		// (4.1) prepare an ID for the new community
 		c := uint(len(communities))
 
-		// (5.2) find the densist unassigned core point as the center point of
+		// (4.2) find the densist unassigned core point as the center point of
 		// the new cluster
 		centerPair := pairN
 		centerDensity := uint(0)
@@ -1417,36 +1587,31 @@ func (cm ConcurrenceModel) PairDBScan(eps float64, minPts uint, simType int) []m
 			}
 		}
 
-		// (5.3) stop the loop if not new centerPt is found
+		// (4.3) stop the loop if not new centerPt is found
 		if centerDensity == uint(0) {
 			break
 		}
 
-		// (5.4) officially create the community
+		// (4.4) officially create the community
 		newCommunity := map[UintPair]bool{centerPair: true}
 		communities = append(communities, newCommunity)
 		communityIDs[centerPair] = c
 
-		// (5.5) iteratively append neighbors to the new community
+		// (4.5) iteratively append neighbors to the new community
 		boundary := map[UintPair]bool{centerPair: true}
 		for len(boundary) > 0 {
 			newBoundary := map[UintPair]bool{}
-			for bpp, _ := range boundary {
-				bppNoncoreNeighbors, exists := noncoreNeighbors[bpp]
-				if exists {
-					for neighbor, _ := range bppNoncoreNeighbors {
-						// skip those already in a community
-						_, alreadyIn := communityIDs[neighbor]
-						if alreadyIn {
-							continue
-						}
-						newCommunity[neighbor] = true
-						communityIDs[neighbor] = c
+			for bpair, _ := range boundary {
+				bppCoreNeighbors, bppNoncoreNeighbors := getPairNeighbors(bpair, pairSimMat, eps,
+					minPts, corePairs)
+				for neighbor, _ := range bppNoncoreNeighbors {
+					// skip those already in a community
+					_, alreadyIn := communityIDs[neighbor]
+					if alreadyIn {
+						continue
 					}
-				}
-				bppCoreNeighbors, exists := coreNeighbors[bpp]
-				if !exists {
-					continue
+					newCommunity[neighbor] = true
+					communityIDs[neighbor] = c
 				}
 				for neighbor, _ := range bppCoreNeighbors {
 					// skip those already in a community
@@ -1466,7 +1631,7 @@ func (cm ConcurrenceModel) PairDBScan(eps float64, minPts uint, simType int) []m
 
 	// -------------------------------------------------------------------------
 	// step 6: add isolated pairs into the result
-	for pair, _ := range pairSimMat {
+	for pair, _ := range pairSimMat.pairs {
 		_, exists := communityIDs[pair]
 		if !exists {
 			newCommunity := map[UintPair]bool{pair: true}
@@ -1641,6 +1806,9 @@ func (cm ConcurrenceModel) AHC(eps float64, simType int) []map[uint]bool {
 //		normalized jaccard similarity
 // output:
 //	A list of clusters.
+// note:
+//	The algorithm of this function is inspired by WPDM. The reference of WPDM could
+//	be found at the beginning of this source file.
 func (cm ConcurrenceModel) PairAHC(eps float64, simType int) []map[UintPair]bool {
 	// -------------------------------------------------------------------------
 	// step 1: create auxiliary data structures
@@ -1663,20 +1831,22 @@ func (cm ConcurrenceModel) PairAHC(eps float64, simType int) []map[UintPair]bool
 	case 4:
 		simMat = cm.InduceNormalizedJaccardSimilarities()
 	}
-	pairSimMat := getPairSimilarities(simMat)
+	pairSimMat := cm.getPairSimilarities(simMat)
 
 	// -------------------------------------------------------------------------
 	// step 3: initialize auxiliary data structures
 	flattenSimMat := map[uint]map[uint]float64{}
 	flattenCommunities := []map[uint]bool{}
-	for pair, _ := range pairSimMat {
+	for pair, _ := range pairSimMat.pairs {
 		idxPair := uint(len(communityIDs))
 		communityIDs[pair] = idxPair
 		idToPair[idxPair] = pair
 		flattenCommunities = append(flattenCommunities, map[uint]bool{idxPair: true})
 		flattenSimMat[idxPair] = map[uint]float64{}
 	}
-	for pair, pairRow := range pairSimMat {
+	for pairSimVec := range pairSimMat.GetRows() {
+		pair := pairSimVec.pair
+		pairRow := pairSimVec.data
 		idxPair, _ := communityIDs[pair]
 		flattenRow, _ := flattenSimMat[idxPair]
 		for neighbor, sim := range pairRow {
@@ -1725,20 +1895,25 @@ func (cm ConcurrenceModel) PairAHC(eps float64, simType int) []map[UintPair]bool
 // input:
 //	groups: a list of groups of items
 //	pairSimMat: the pairwise similarity mat
+//	eps: the radius of neighborhood for making the result more sparse
 // output:
 //	the group similarities
-func getGroupPairSimilarities(groups []map[uint]bool,
-	pairSimMat map[UintPair]map[UintPair]float64) map[uint]map[uint]float64 {
+func getGroupPairSimilarities(groups []map[uint]bool, pairSimMat PairSimMat,
+	eps float64) map[uint]map[uint]float64 {
 	// -------------------------------------------------------------------------
 	// step 1: convert groups to pair representation
 	numGroups := uint(len(groups))
-	pairsOfGroups := make([]map[UintPair]bool, numGroups)
+	pairsOfGroups := make([]map[UintPair]uint, numGroups)
 	for idxGroup, group := range groups {
-		pairs := map[UintPair]bool{}
+		pairs := map[UintPair]uint{}
 		for i, _ := range group {
 			for j, _ := range group {
 				if i < j {
-					pairs[MakeUintPair(i, j)] = true
+					pair := MakeUintPair(i, j)
+					idxPair, exists := pairSimMat.pairs[pair]
+					if exists {
+						pairs[pair] = idxPair
+					}
 				}
 			}
 		}
@@ -1746,44 +1921,195 @@ func getGroupPairSimilarities(groups []map[uint]bool,
 	}
 
 	// ------------------------------------------------------------------------
-	// step 2: compute the result
+	// step 2: find 5% most frequent pairs
+	pairGroupCount := map[UintPair]uint{}
+	for _, pairs := range pairsOfGroups {
+		for pair, _ := range pairs {
+			count, exists := pairGroupCount[pair]
+			if !exists {
+				count = uint(0)
+			}
+			pairGroupCount[pair] = count + uint(1)
+		}
+	}
+	numSortedPairs := len(pairGroupCount)
+	sortedPairs := make([]UintPair, numSortedPairs)
+	idx := 0
+	for pair, _ := range pairGroupCount {
+		sortedPairs[idx] = pair
+		idx++
+	}
+	sort.Slice(sortedPairs, func(i, j int) bool {
+		valueI, _ := pairGroupCount[sortedPairs[i]]
+		valueJ, _ := pairGroupCount[sortedPairs[j]]
+		return valueI > valueJ
+	})
+	numMostFrequent := numSortedPairs / 20
+	mostFrequent := sortedPairs[0:numMostFrequent]
+
+	// ------------------------------------------------------------------------
+	// step 3: get similarities for the most frequent pairs
+	simRowsOfMostFrequent := map[UintPair]map[UintPair]float64{}
+	numCPUs := runtime.NumCPU()
+	chIdxs := make(chan int)
+	chPairSimVec := make(chan PairSimVec)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func(idxCPU int) {
+			mySimRows := map[UintPair]map[UintPair]float64{}
+			for idx := range chIdxs {
+				pair := mostFrequent[idx]
+				idxPair := pairSimMat.pairs[pair]
+				simRow := pairSimMat.GetRow(pair, idxPair)
+				mySimRows[pair] = simRow
+				if len(mySimRows) > 0 && len(mySimRows)%10 == 0 {
+					fmt.Printf("%d: %d of %d sim rows have been computed\n", idxCPU,
+						len(mySimRows), numMostFrequent)
+				}
+			}
+			for pair, simRow := range mySimRows {
+				chPairSimVec <- PairSimVec{pair: pair, data: simRow}
+			}
+		}(idxCPU)
+	}
+	for i := 0; i < numMostFrequent; i++ {
+		chIdxs <- i
+	}
+	close(chIdxs)
+	for i := 0; i < numMostFrequent; i++ {
+		fmt.Printf("most freq: %d of %d\n", i, numMostFrequent)
+		pairSimVec := <-chPairSimVec
+		simRowsOfMostFrequent[pairSimVec.pair] = pairSimVec.data
+	}
+	runtime.GC()
+
+	// ------------------------------------------------------------------------
+	// step 4: compute the result
 	result := map[uint]map[uint]float64{}
 	for i := uint(0); i < numGroups; i++ {
 		rowOfResult := map[uint]float64{i: 1.0}
 		result[i] = rowOfResult
 	}
-	for i := uint(0); i < numGroups; i++ {
-		pairsOfI := pairsOfGroups[i]
-		for j := uint(0); j < numGroups; j++ {
-			if i < j {
-				pairsOfJ := pairsOfGroups[j]
-				simIJ := 0.0
-				for pairI, _ := range pairsOfI {
-					simRowOfI, exists := pairSimMat[pairI]
-					if !exists {
-						continue
-					}
-					for pairJ, _ := range pairsOfJ {
-						sim, exists := simRowOfI[pairJ]
-						if !exists {
-							continue
-						}
-						simIJ += sim
-					}
-				}
-				if simIJ == 0.0 {
+	chIdxs = make(chan int)
+	chWorkers := make(chan bool)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			for idx := range chIdxs {
+				pairs := pairsOfGroups[idx]
+				if len(pairs) == 0 {
 					continue
 				}
-				simIJ /= float64(len(pairsOfI) * len(pairsOfJ))
-				result[i][j] = simIJ
-				result[j][i] = simIJ
+				simRows := map[UintPair]map[UintPair]float64{}
+				for pair, idxPair := range pairs {
+					simRow, exists := simRowsOfMostFrequent[pair]
+					if !exists {
+						simRow = pairSimMat.GetRow(pair, idxPair)
+					}
+					simRows[pair] = simRow
+				}
+				fmt.Printf("%d of %d\n", idx, numGroups)
+				for j := uint(0); j < numGroups; j++ {
+					pairsOfJ := pairsOfGroups[j]
+					if len(pairsOfJ) == 0 {
+						continue
+					}
+					simIJ := 0.0
+					for pairI, _ := range pairs {
+						simRowOfI, _ := simRows[pairI]
+						for pairJ, _ := range pairsOfJ {
+							sim, exists := simRowOfI[pairJ]
+							if !exists {
+								continue
+							}
+							simIJ += sim
+						}
+					}
+					simIJ /= float64(len(pairs) * len(pairsOfJ))
+					result[uint(idx)][j] = simIJ
+				}
 			}
-		}
+			chWorkers <- true
+		}()
+	}
+	for i := 0; i < int(numGroups); i++ {
+		chIdxs <- i
+	}
+	close(chIdxs)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		<-chWorkers
 	}
 
 	// ------------------------------------------------------------------------
 	// step 3: return the result
 	return result
+}
+
+// =============================================================================
+// func (cm ConcurrenceModel) GetGroupSimMat
+func (cm ConcurrenceModel) GetGroupSimMat(groups []map[uint]bool, eps float64,
+	simType int, fileName string) map[uint]map[uint]float64 {
+	file, err := os.Open(fileName)
+	if err != nil {
+		simMat := map[uint]map[uint]float64{}
+		switch simType {
+		case 0:
+			simMat = cm.InduceSimilarities()
+		case 1:
+			simMat = cm.InduceNormalizedSimilarities()
+		case 2:
+			simMat = cm.InduceJaccardSimilarities()
+		case 3:
+			simMat = cm.InduceWeightedJaccardSimilarities()
+		case 4:
+			simMat = cm.InduceNormalizedJaccardSimilarities()
+		}
+		pairSimMat := cm.getPairSimilarities(simMat)
+		groupSimMat := getGroupPairSimilarities(groups, pairSimMat, eps)
+		file, err = os.Create(fileName)
+		if err != nil {
+			log.Fatalln(err)
+		}
+		for i, row := range groupSimMat {
+			file.WriteString(fmt.Sprintf("%d,%d\n", i, len(row)))
+			for j, value := range row {
+				file.WriteString(fmt.Sprintf("%d,%v\n", j, value))
+			}
+		}
+		file.Close()
+		return groupSimMat
+	} else {
+		defer file.Close()
+		groupSimMat := map[uint]map[uint]float64{}
+		scanner := bufio.NewScanner(file)
+		for {
+			if !scanner.Scan() {
+				break
+			}
+			var i uint
+			var lenRow int
+			_, err := fmt.Sscanf(scanner.Text(), "%d,%d", &i, &lenRow)
+			if err != nil {
+				log.Fatalln(fmt.Sprintf("file %s is of wrong format", fileName))
+			}
+			row := map[uint]float64{}
+			groupSimMat[i] = row
+			for k := 0; k < lenRow; k++ {
+				if !scanner.Scan() {
+					log.Fatalln(fmt.Sprintf("file %s is of wrong format", fileName))
+				}
+				var j uint
+				var value float64
+				_, err := fmt.Sscanf(scanner.Text(), "%d,%v", &j, &value)
+				if err != nil {
+					log.Fatalln(fmt.Sprintf("file %s is of wrong format", fileName))
+				}
+				row[j] = value
+			}
+			if len(groupSimMat)%100 == 0 {
+				fmt.Printf("%d rows of groupSimMat loaded\n", len(groupSimMat))
+			}
+		}
+		return groupSimMat
+	}
 }
 
 // =============================================================================
@@ -1798,10 +2124,15 @@ func getGroupPairSimilarities(groups []map[uint]bool,
 //	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
 //		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
 //		normalized jaccard similarity
+//	workSpaceFileName: a file name for intermediate result
 // output:
 //	A list of clusters.
+// note:
+// note:
+//	The algorithm of this function is inspired by WPDM. The reference of WPDM could
+//	be found at the beginning of this source file.
 func (cm ConcurrenceModel) GroupPairDBScan(groups []map[uint]bool, eps float64, minPts uint,
-	simType int) []map[uint]bool {
+	simType int, workSpaceFileName string) []map[uint]bool {
 	// -------------------------------------------------------------------------
 	// step 1: initialize auxiliary data structures
 	communityIDs := map[uint]uint{}
@@ -1809,21 +2140,7 @@ func (cm ConcurrenceModel) GroupPairDBScan(groups []map[uint]bool, eps float64, 
 
 	// -------------------------------------------------------------------------
 	// step 2: build the similarity matrix
-	simMat := map[uint]map[uint]float64{}
-	switch simType {
-	case 0:
-		simMat = cm.InduceSimilarities()
-	case 1:
-		simMat = cm.InduceNormalizedSimilarities()
-	case 2:
-		simMat = cm.InduceJaccardSimilarities()
-	case 3:
-		simMat = cm.InduceWeightedJaccardSimilarities()
-	case 4:
-		simMat = cm.InduceNormalizedJaccardSimilarities()
-	}
-	pairSimMat := getPairSimilarities(simMat)
-	groupSimMat := getGroupPairSimilarities(groups, pairSimMat)
+	groupSimMat := cm.GetGroupSimMat(groups, eps, simType, workSpaceFileName)
 
 	// -------------------------------------------------------------------------
 	// step 3: find all core points and their neighborhood densities
@@ -1928,9 +2245,14 @@ func (cm ConcurrenceModel) GroupPairDBScan(groups []map[uint]bool, eps float64, 
 //	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
 //		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
 //		normalized jaccard similarity
+//	workSpaceFileName: a file name for intermediate result
 // output:
 //	A list of clusters.
-func (cm ConcurrenceModel) GroupPairAHC(groups []map[uint]bool, eps float64, simType int) []map[uint]bool {
+// note:
+//	The algorithm of this function is inspired by WPDM. The reference of WPDM could
+//	be found at the beginning of this source file.
+func (cm ConcurrenceModel) GroupPairAHC(groups []map[uint]bool, eps float64, simType int,
+	workSpaceFileName string) []map[uint]bool {
 	// -------------------------------------------------------------------------
 	// step 1: initialize auxiliary data structures
 	n := uint(len(groups))
@@ -1943,21 +2265,7 @@ func (cm ConcurrenceModel) GroupPairAHC(groups []map[uint]bool, eps float64, sim
 
 	// -------------------------------------------------------------------------
 	// step 2: build the similarity matrix
-	simMat := map[uint]map[uint]float64{}
-	switch simType {
-	case 0:
-		simMat = cm.InduceSimilarities()
-	case 1:
-		simMat = cm.InduceNormalizedSimilarities()
-	case 2:
-		simMat = cm.InduceJaccardSimilarities()
-	case 3:
-		simMat = cm.InduceWeightedJaccardSimilarities()
-	case 4:
-		simMat = cm.InduceNormalizedJaccardSimilarities()
-	}
-	pairSimMat := getPairSimilarities(simMat)
-	groupSimMat := getGroupPairSimilarities(groups, pairSimMat)
+	groupSimMat := cm.GetGroupSimMat(groups, eps, simType, workSpaceFileName)
 
 	// -------------------------------------------------------------------------
 	// step 3: build clusterwise distance matrix
