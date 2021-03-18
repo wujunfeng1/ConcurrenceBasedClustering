@@ -62,6 +62,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -251,7 +252,7 @@ func (cm *ConcurrenceModel) SetConcurrences(n uint,
 	varConcurrenceOf := make([]float64, n)
 	for u := uint(0); u < n; u++ {
 		if sumConcurrencesOf[u] == 0 {
-			varConcurrenceOf[u] = 0.0
+			varConcurrenceOf[u] = 1e-32
 		} else {
 			varConcurrenceOf[u] = 0.0
 			for _, weightUV := range concurrences[u] {
@@ -259,6 +260,9 @@ func (cm *ConcurrenceModel) SetConcurrences(n uint,
 				varConcurrenceOf[u] += diffFromMean * diffFromMean
 			}
 			varConcurrenceOf[u] /= float64(len(concurrences[u]))
+			if varConcurrenceOf[u] < 1e-32 {
+				varConcurrenceOf[u] = 1e-32
+			}
 		}
 	}
 
@@ -475,43 +479,75 @@ func (cm ConcurrenceModel) InduceNormalizedSimilarities() map[uint]map[uint]floa
 //	A Jaccard similarity matrix induced from concurrences
 func (cm ConcurrenceModel) InduceJaccardSimilarities() map[uint]map[uint]float64 {
 	simMat := map[uint]map[uint]float64{}
-	for u := uint(0); u < cm.n; u++ {
-		row := map[uint]float64{u: 1.0}
-		weightsOfU := cm.GetConcurrencesOf(u)
-		for v, _ := range weightsOfU {
-			weightsOfV := cm.GetConcurrencesOf(v)
-
-			// compute the size of intersection of neighborU and neighborV
-			numInIntersection := 0
-			if len(weightsOfU) < len(weightsOfV) {
-				for neighborU, _ := range weightsOfU {
-					_, isNeighborV := weightsOfV[neighborU]
-					if isNeighborV {
-						numInIntersection++
-					}
+	lock := sync.RWMutex{}
+	numCPUs := runtime.NumCPU()
+	chU := make(chan uint)
+	chWorkers := make(chan bool)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			mySimMat := map[uint]map[uint]float64{}
+			for u0 := range chU {
+				u1 := u0 + 100
+				if u1 > cm.n {
+					u1 = cm.n
 				}
-			} else {
-				for neighborV, _ := range weightsOfV {
-					_, isNeighborU := weightsOfU[neighborV]
-					if isNeighborU {
-						numInIntersection++
+				for u := u0; u < u1; u++ {
+					row := map[uint]float64{u: 1.0}
+					mySimMat[u] = row
+					weightsOfU := cm.GetConcurrencesOf(u)
+					for v, _ := range weightsOfU {
+						weightsOfV := cm.GetConcurrencesOf(v)
+
+						// compute the size of intersection of neighborU and neighborV
+						numInIntersection := 0
+						if len(weightsOfU) < len(weightsOfV) {
+							for neighborU, _ := range weightsOfU {
+								_, isNeighborV := weightsOfV[neighborU]
+								if isNeighborV {
+									numInIntersection++
+								}
+							}
+						} else {
+							for neighborV, _ := range weightsOfV {
+								_, isNeighborU := weightsOfU[neighborV]
+								if isNeighborU {
+									numInIntersection++
+								}
+							}
+						}
+
+						// skip if it is an empty intersection
+						if numInIntersection == 0 {
+							continue
+						}
+
+						// compute the size of union of neighborU and neighborV
+						numInUnion := len(weightsOfU) + len(weightsOfV) - numInIntersection
+
+						// compute the similarity of u and v
+						row[v] = float64(numInIntersection) / float64(numInUnion)
 					}
 				}
 			}
 
-			// skip if it is an empty intersection
-			if numInIntersection == 0 {
-				continue
+			lock.Lock()
+			for u, row := range mySimMat {
+				simMat[u] = row
 			}
+			lock.Unlock()
 
-			// compute the size of union of neighborU and neighborV
-			numInUnion := len(weightsOfU) + len(weightsOfV) - numInIntersection
-
-			// compute the similarity of u and v
-			row[v] = float64(numInIntersection) / float64(numInUnion)
-		}
-		simMat[u] = row
+			chWorkers <- true
+		}()
 	}
+
+	for u := uint(0); u < cm.n; u += 100 {
+		chU <- u
+	}
+	close(chU)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		<-chWorkers
+	}
+
 	return simMat
 }
 
@@ -525,40 +561,72 @@ func (cm ConcurrenceModel) InduceJaccardSimilarities() map[uint]map[uint]float64
 //	A weighted Jaccard similarity matrix induced from concurrences
 func (cm ConcurrenceModel) InduceWeightedJaccardSimilarities() map[uint]map[uint]float64 {
 	simMat := map[uint]map[uint]float64{}
-	for u := uint(0); u < cm.n; u++ {
-		row := map[uint]float64{u: 1.0}
-		weightsOfU := cm.GetConcurrencesOf(u)
-		if len(weightsOfU) == 0 {
-			continue
-		}
-		cu := 1.0 / float64(cm.sumConcurrencesOf[u])
-		for v, _ := range weightsOfU {
-			weightsOfV := cm.GetConcurrencesOf(v)
-			cv := 1.0 / float64(cm.sumConcurrencesOf[v])
-
-			// compute the weighted size of intersection of neighborU and neighborV
-			sumWeightInIntersection := 0.0
-			if len(weightsOfU) < len(weightsOfV) {
-				for neighborU, weightAtU := range weightsOfU {
-					weightAtV, isNeighborV := weightsOfV[neighborU]
-					if isNeighborV {
-						sumWeightInIntersection += float64(weightAtU*weightAtV) * cu * cv
-					}
+	lock := sync.RWMutex{}
+	numCPUs := runtime.NumCPU()
+	chU := make(chan uint)
+	chWorkers := make(chan bool)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			mySimMat := map[uint]map[uint]float64{}
+			for u0 := range chU {
+				u1 := u0 + 100
+				if u1 > cm.n {
+					u1 = cm.n
 				}
-			} else {
-				for neighborV, weightAtV := range weightsOfV {
-					weightAtU, isNeighborU := weightsOfU[neighborV]
-					if isNeighborU {
-						sumWeightInIntersection += float64(weightAtU*weightAtV) * cu * cv
+				for u := u0; u < u1; u++ {
+					row := map[uint]float64{u: 1.0}
+					mySimMat[u] = row
+					weightsOfU := cm.GetConcurrencesOf(u)
+					if len(weightsOfU) == 0 {
+						continue
+					}
+					cu := 1.0 / float64(cm.sumConcurrencesOf[u])
+					for v, _ := range weightsOfU {
+						weightsOfV := cm.GetConcurrencesOf(v)
+						cv := 1.0 / float64(cm.sumConcurrencesOf[v])
+
+						// compute the weighted size of intersection of neighborU and neighborV
+						sumWeightInIntersection := 0.0
+						if len(weightsOfU) < len(weightsOfV) {
+							for neighborU, weightAtU := range weightsOfU {
+								weightAtV, isNeighborV := weightsOfV[neighborU]
+								if isNeighborV {
+									sumWeightInIntersection += float64(weightAtU*weightAtV) * cu * cv
+								}
+							}
+						} else {
+							for neighborV, weightAtV := range weightsOfV {
+								weightAtU, isNeighborU := weightsOfU[neighborV]
+								if isNeighborU {
+									sumWeightInIntersection += float64(weightAtU*weightAtV) * cu * cv
+								}
+							}
+						}
+
+						// compute the similarity of u and v
+						row[v] = sumWeightInIntersection
 					}
 				}
 			}
 
-			// compute the similarity of u and v
-			row[v] = sumWeightInIntersection
-		}
-		simMat[u] = row
+			lock.Lock()
+			for u, row := range mySimMat {
+				simMat[u] = row
+			}
+			lock.Unlock()
+
+			chWorkers <- true
+		}()
 	}
+
+	for u := uint(0); u < cm.n; u += 100 {
+		chU <- u
+	}
+	close(chU)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		<-chWorkers
+	}
+
 	return simMat
 }
 
@@ -582,49 +650,84 @@ func (cm ConcurrenceModel) InduceNormalizedJaccardSimilarities() map[uint]map[ui
 		}
 	}
 
-	for u := uint(0); u < cm.n; u++ {
-		row := map[uint]float64{u: 1.0}
-		weightsOfU := cm.GetConcurrencesOf(u)
-		if len(weightsOfU) == 0 {
-			continue
-		}
-		cu := 1.0 / sumNormalizedWeightsOf[u]
-		for v, _ := range weightsOfU {
-			weightsOfV := cm.GetConcurrencesOf(v)
-			cv := 1.0 / sumNormalizedWeightsOf[v]
-
-			// compute the weighted size of intersection of neighborU and neighborV
-			sumWeightInIntersection := 0.0
-			if len(weightsOfU) < len(weightsOfV) {
-				for neighborU, weightAtU := range weightsOfU {
-					weightAtV, isNeighborV := weightsOfV[neighborU]
-					if isNeighborV {
-						wu := cu * math.Erf((float64(weightAtU)-cm.meanConcurrenceOf[u])/
-							cm.varConcurrenceOf[u])
-						wv := cv * math.Erf((float64(weightAtV)-cm.meanConcurrenceOf[v])/
-							cm.varConcurrenceOf[v])
-						sumWeightInIntersection += wu * wv
-
-					}
+	lock := sync.RWMutex{}
+	numCPUs := runtime.NumCPU()
+	chU := make(chan uint)
+	chWorkers := make(chan bool)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			mySimMat := map[uint]map[uint]float64{}
+			for u0 := range chU {
+				u1 := u0 + 100
+				if u1 > cm.n {
+					u1 = cm.n
 				}
-			} else {
-				for neighborV, weightAtV := range weightsOfV {
-					weightAtU, isNeighborU := weightsOfU[neighborV]
-					if isNeighborU {
-						wu := cu * math.Erf((float64(weightAtU)-cm.meanConcurrenceOf[u])/
-							cm.varConcurrenceOf[u])
-						wv := cv * math.Erf((float64(weightAtV)-cm.meanConcurrenceOf[v])/
-							cm.varConcurrenceOf[v])
-						sumWeightInIntersection += wu * wv
+				for u := u0; u < u1; u++ {
+					row := map[uint]float64{u: 1.0}
+					mySimMat[u] = row
+					weightsOfU := cm.GetConcurrencesOf(u)
+					if len(weightsOfU) == 0 || sumNormalizedWeightsOf[u] == 0.0 {
+						continue
+					}
+					cu := 1.0 / sumNormalizedWeightsOf[u]
+					for v, _ := range weightsOfU {
+						weightsOfV := cm.GetConcurrencesOf(v)
+						if len(weightsOfV) == 0 || sumNormalizedWeightsOf[v] == 0.0 {
+							continue
+						}
+						cv := 1.0 / sumNormalizedWeightsOf[v]
+
+						// compute the weighted size of intersection of neighborU and neighborV
+						sumWeightInIntersection := 0.0
+						if len(weightsOfU) < len(weightsOfV) {
+							for neighborU, weightAtU := range weightsOfU {
+								weightAtV, isNeighborV := weightsOfV[neighborU]
+								if isNeighborV {
+									wu := cu * math.Erf((float64(weightAtU)-cm.meanConcurrenceOf[u])/
+										cm.varConcurrenceOf[u])
+									wv := cv * math.Erf((float64(weightAtV)-cm.meanConcurrenceOf[v])/
+										cm.varConcurrenceOf[v])
+									sumWeightInIntersection += wu * wv
+
+								}
+							}
+						} else {
+							for neighborV, weightAtV := range weightsOfV {
+								weightAtU, isNeighborU := weightsOfU[neighborV]
+								if isNeighborU {
+									wu := cu * math.Erf((float64(weightAtU)-cm.meanConcurrenceOf[u])/
+										cm.varConcurrenceOf[u])
+									wv := cv * math.Erf((float64(weightAtV)-cm.meanConcurrenceOf[v])/
+										cm.varConcurrenceOf[v])
+									sumWeightInIntersection += wu * wv
+								}
+							}
+						}
+
+						// compute the similarity of u and v
+						row[v] = sumWeightInIntersection
 					}
 				}
 			}
 
-			// compute the similarity of u and v
-			row[v] = sumWeightInIntersection
-		}
-		simMat[u] = row
+			lock.Lock()
+			for u, row := range mySimMat {
+				simMat[u] = row
+			}
+			lock.Unlock()
+
+			chWorkers <- true
+		}()
 	}
+
+	for u := uint(0); u < cm.n; u += 100 {
+		chU <- u
+	}
+	close(chU)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		<-chWorkers
+	}
+
 	return simMat
 }
 
