@@ -81,6 +81,7 @@ type ConcurrenceModel struct {
 	// basic fields:
 	n            uint
 	concurrences map[uint]map[uint]float64
+	exclusions   map[uint]map[uint]bool
 
 	// ------------------------------------------------------------------------
 	// statistical fields
@@ -165,7 +166,7 @@ func verifyConcurrences(n uint, concurrences map[uint]map[uint]float64) {
 //		then the element is 0.
 // output:
 //	the vector mentioned in brief description.
-func getSumConcurrencesOf(n uint, concurrences map[uint]map[uint]float64,
+func GetSumConcurrencesOf(n uint, concurrences map[uint]map[uint]float64,
 ) []float64 {
 	// -------------------------------------------------------------------------
 	// step 1:
@@ -210,6 +211,18 @@ func (cm *ConcurrenceModel) SetPairFilter(balanceThreshold float64,
 }
 
 // =============================================================================
+// func (cm *ConcurrenceModel) SetExclusions
+// brief description: set the exclusions of cm to avoid computing similarities between excluded
+//	pairs
+// input:
+//	exclusions: the map of exclusions
+// output:
+//	nothing.
+func (cm *ConcurrenceModel) SetExclusions(exclusions map[uint]map[uint]bool) {
+	cm.exclusions = exclusions
+}
+
+// =============================================================================
 // func (cm *ConcurrenceModel) SetConcurrences
 // brief description: set the concurrences of cm
 // input:
@@ -227,7 +240,7 @@ func (cm *ConcurrenceModel) SetConcurrences(n uint,
 
 	// -------------------------------------------------------------------------
 	// step 2: get the nodewise sum of weights
-	sumConcurrencesOf := getSumConcurrencesOf(n, concurrences)
+	sumConcurrencesOf := GetSumConcurrencesOf(n, concurrences)
 
 	// -------------------------------------------------------------------------
 	// step 3: compute the sum of all weights
@@ -299,6 +312,22 @@ func (cm ConcurrenceModel) GetConcurrencesOf(i uint) map[uint]float64 {
 		return weightsOfI
 	} else {
 		return map[uint]float64{}
+	}
+}
+
+// =============================================================================
+// func (cm ConcurrenceModel) GetExclusionsOf
+// brief description: get the exclusions related to a node
+// input:
+//	i: a point ID
+// output:
+//	the frequency of the concurrence of i if exists, 0 otherwise
+func (cm ConcurrenceModel) GetExclusionsOf(i uint) map[uint]bool {
+	exclusionsOfI, exists := cm.exclusions[i]
+	if exists {
+		return exclusionsOfI
+	} else {
+		return map[uint]bool{}
 	}
 }
 
@@ -432,12 +461,16 @@ func (cm ConcurrenceModel) InduceSimilarities() map[uint]map[uint]float64 {
 		row := map[uint]float64{u: 1.0}
 		cu := 0.5 / cm.sumConcurrencesOf[u]
 		weightsOfU := cm.GetConcurrencesOf(u)
+		exclusionsOfU := cm.GetExclusionsOf(u)
 		if len(weightsOfU) == 0 {
 			continue
 		}
 		for v, weightUV := range weightsOfU {
-			cv := 0.5 / cm.sumConcurrencesOf[v]
-			row[v] = weightUV * (cu + cv)
+			_, excluded := exclusionsOfU[v]
+			if !excluded {
+				cv := 0.5 / cm.sumConcurrencesOf[v]
+				row[v] = weightUV * (cu + cv)
+			}
 		}
 		simMat[u] = row
 	}
@@ -458,12 +491,16 @@ func (cm ConcurrenceModel) InduceNormalizedSimilarities() map[uint]map[uint]floa
 	for u := uint(0); u < cm.n; u++ {
 		row := map[uint]float64{u: 1.0}
 		weightsOfU := cm.GetConcurrencesOf(u)
+		exclusionsOfU := cm.GetExclusionsOf(u)
 		for v, weightUV := range weightsOfU {
-			normalizedWeightU := math.Erf((float64(weightUV) - cm.meanConcurrenceOf[u]) /
-				cm.varConcurrenceOf[u])
-			normalizedWeightV := math.Erf((float64(weightUV) - cm.meanConcurrenceOf[v]) /
-				cm.varConcurrenceOf[v])
-			row[v] = 0.5 * (normalizedWeightU + normalizedWeightV)
+			_, excluded := exclusionsOfU[v]
+			if !excluded {
+				normalizedWeightU := math.Erf((float64(weightUV) - cm.meanConcurrenceOf[u]) /
+					cm.varConcurrenceOf[u])
+				normalizedWeightV := math.Erf((float64(weightUV) - cm.meanConcurrenceOf[v]) /
+					cm.varConcurrenceOf[v])
+				row[v] = 0.5 * (normalizedWeightU + normalizedWeightV)
+			}
 		}
 		simMat[u] = row
 	}
@@ -495,37 +532,41 @@ func (cm ConcurrenceModel) InduceJaccardSimilarities() map[uint]map[uint]float64
 					row := map[uint]float64{u: 1.0}
 					mySimMat[u] = row
 					weightsOfU := cm.GetConcurrencesOf(u)
+					exclusionsOfU := cm.GetExclusionsOf(u)
 					for v, _ := range weightsOfU {
-						weightsOfV := cm.GetConcurrencesOf(v)
+						_, excluded := exclusionsOfU[v]
+						if !excluded {
+							weightsOfV := cm.GetConcurrencesOf(v)
 
-						// compute the size of intersection of neighborU and neighborV
-						numInIntersection := 0
-						if len(weightsOfU) < len(weightsOfV) {
-							for neighborU, _ := range weightsOfU {
-								_, isNeighborV := weightsOfV[neighborU]
-								if isNeighborV {
-									numInIntersection++
+							// compute the size of intersection of neighborU and neighborV
+							numInIntersection := 0
+							if len(weightsOfU) < len(weightsOfV) {
+								for neighborU, _ := range weightsOfU {
+									_, isNeighborV := weightsOfV[neighborU]
+									if isNeighborV {
+										numInIntersection++
+									}
+								}
+							} else {
+								for neighborV, _ := range weightsOfV {
+									_, isNeighborU := weightsOfU[neighborV]
+									if isNeighborU {
+										numInIntersection++
+									}
 								}
 							}
-						} else {
-							for neighborV, _ := range weightsOfV {
-								_, isNeighborU := weightsOfU[neighborV]
-								if isNeighborU {
-									numInIntersection++
-								}
+
+							// skip if it is an empty intersection
+							if numInIntersection == 0 {
+								continue
 							}
+
+							// compute the size of union of neighborU and neighborV
+							numInUnion := len(weightsOfU) + len(weightsOfV) - numInIntersection
+
+							// compute the similarity of u and v
+							row[v] = float64(numInIntersection) / float64(numInUnion)
 						}
-
-						// skip if it is an empty intersection
-						if numInIntersection == 0 {
-							continue
-						}
-
-						// compute the size of union of neighborU and neighborV
-						numInUnion := len(weightsOfU) + len(weightsOfV) - numInIntersection
-
-						// compute the similarity of u and v
-						row[v] = float64(numInIntersection) / float64(numInUnion)
 					}
 				}
 			}
@@ -577,34 +618,38 @@ func (cm ConcurrenceModel) InduceWeightedJaccardSimilarities() map[uint]map[uint
 					row := map[uint]float64{u: 1.0}
 					mySimMat[u] = row
 					weightsOfU := cm.GetConcurrencesOf(u)
+					exclusionsOfU := cm.GetExclusionsOf(u)
 					if len(weightsOfU) == 0 {
 						continue
 					}
 					cu := 1.0 / float64(cm.sumConcurrencesOf[u])
 					for v, _ := range weightsOfU {
-						weightsOfV := cm.GetConcurrencesOf(v)
-						cv := 1.0 / float64(cm.sumConcurrencesOf[v])
+						_, excluded := exclusionsOfU[v]
+						if !excluded {
+							weightsOfV := cm.GetConcurrencesOf(v)
+							cv := 1.0 / float64(cm.sumConcurrencesOf[v])
 
-						// compute the weighted size of intersection of neighborU and neighborV
-						sumWeightInIntersection := 0.0
-						if len(weightsOfU) < len(weightsOfV) {
-							for neighborU, weightAtU := range weightsOfU {
-								weightAtV, isNeighborV := weightsOfV[neighborU]
-								if isNeighborV {
-									sumWeightInIntersection += float64(weightAtU*weightAtV) * cu * cv
+							// compute the weighted size of intersection of neighborU and neighborV
+							sumWeightInIntersection := 0.0
+							if len(weightsOfU) < len(weightsOfV) {
+								for neighborU, weightAtU := range weightsOfU {
+									weightAtV, isNeighborV := weightsOfV[neighborU]
+									if isNeighborV {
+										sumWeightInIntersection += float64(weightAtU*weightAtV) * cu * cv
+									}
+								}
+							} else {
+								for neighborV, weightAtV := range weightsOfV {
+									weightAtU, isNeighborU := weightsOfU[neighborV]
+									if isNeighborU {
+										sumWeightInIntersection += float64(weightAtU*weightAtV) * cu * cv
+									}
 								}
 							}
-						} else {
-							for neighborV, weightAtV := range weightsOfV {
-								weightAtU, isNeighborU := weightsOfU[neighborV]
-								if isNeighborU {
-									sumWeightInIntersection += float64(weightAtU*weightAtV) * cu * cv
-								}
-							}
+
+							// compute the similarity of u and v
+							row[v] = sumWeightInIntersection
 						}
-
-						// compute the similarity of u and v
-						row[v] = sumWeightInIntersection
 					}
 				}
 			}
@@ -666,46 +711,50 @@ func (cm ConcurrenceModel) InduceNormalizedJaccardSimilarities() map[uint]map[ui
 					row := map[uint]float64{u: 1.0}
 					mySimMat[u] = row
 					weightsOfU := cm.GetConcurrencesOf(u)
+					exclusionsOfU := cm.GetExclusionsOf(u)
 					if len(weightsOfU) == 0 || sumNormalizedWeightsOf[u] == 0.0 {
 						continue
 					}
 					cu := 1.0 / sumNormalizedWeightsOf[u]
 					for v, _ := range weightsOfU {
-						weightsOfV := cm.GetConcurrencesOf(v)
-						if len(weightsOfV) == 0 || sumNormalizedWeightsOf[v] == 0.0 {
-							continue
-						}
-						cv := 1.0 / sumNormalizedWeightsOf[v]
+						_, excluded := exclusionsOfU[v]
+						if !excluded {
+							weightsOfV := cm.GetConcurrencesOf(v)
+							if len(weightsOfV) == 0 || sumNormalizedWeightsOf[v] == 0.0 {
+								continue
+							}
+							cv := 1.0 / sumNormalizedWeightsOf[v]
 
-						// compute the weighted size of intersection of neighborU and neighborV
-						sumWeightInIntersection := 0.0
-						if len(weightsOfU) < len(weightsOfV) {
-							for neighborU, weightAtU := range weightsOfU {
-								weightAtV, isNeighborV := weightsOfV[neighborU]
-								if isNeighborV {
-									wu := cu * math.Erf((float64(weightAtU)-cm.meanConcurrenceOf[u])/
-										cm.varConcurrenceOf[u])
-									wv := cv * math.Erf((float64(weightAtV)-cm.meanConcurrenceOf[v])/
-										cm.varConcurrenceOf[v])
-									sumWeightInIntersection += wu * wv
+							// compute the weighted size of intersection of neighborU and neighborV
+							sumWeightInIntersection := 0.0
+							if len(weightsOfU) < len(weightsOfV) {
+								for neighborU, weightAtU := range weightsOfU {
+									weightAtV, isNeighborV := weightsOfV[neighborU]
+									if isNeighborV {
+										wu := cu * math.Erf((float64(weightAtU)-cm.meanConcurrenceOf[u])/
+											cm.varConcurrenceOf[u])
+										wv := cv * math.Erf((float64(weightAtV)-cm.meanConcurrenceOf[v])/
+											cm.varConcurrenceOf[v])
+										sumWeightInIntersection += wu * wv
 
+									}
+								}
+							} else {
+								for neighborV, weightAtV := range weightsOfV {
+									weightAtU, isNeighborU := weightsOfU[neighborV]
+									if isNeighborU {
+										wu := cu * math.Erf((float64(weightAtU)-cm.meanConcurrenceOf[u])/
+											cm.varConcurrenceOf[u])
+										wv := cv * math.Erf((float64(weightAtV)-cm.meanConcurrenceOf[v])/
+											cm.varConcurrenceOf[v])
+										sumWeightInIntersection += wu * wv
+									}
 								}
 							}
-						} else {
-							for neighborV, weightAtV := range weightsOfV {
-								weightAtU, isNeighborU := weightsOfU[neighborV]
-								if isNeighborU {
-									wu := cu * math.Erf((float64(weightAtU)-cm.meanConcurrenceOf[u])/
-										cm.varConcurrenceOf[u])
-									wv := cv * math.Erf((float64(weightAtV)-cm.meanConcurrenceOf[v])/
-										cm.varConcurrenceOf[v])
-									sumWeightInIntersection += wu * wv
-								}
-							}
-						}
 
-						// compute the similarity of u and v
-						row[v] = sumWeightInIntersection
+							// compute the similarity of u and v
+							row[v] = sumWeightInIntersection
+						}
 					}
 				}
 			}
