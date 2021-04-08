@@ -54,12 +54,11 @@ package ConcurrenceBasedClustering
 // =============================================================================
 
 import (
-	"bufio"
 	"fmt"
 	"log"
-	"math"
+
+	//"math"
 	"math/rand"
-	"os"
 	"runtime"
 	"sort"
 	"sync"
@@ -79,79 +78,50 @@ func init() {
 type ConcurrenceModel struct {
 	// ------------------------------------------------------------------------
 	// basic fields:
-	n            uint
-	concurrences map[uint]map[uint]float64
-	exclusions   map[uint]map[uint]bool
+	n             int
+	cardinalities []int
+	concurrences  []map[int]float64
 
 	// ------------------------------------------------------------------------
 	// statistical fields
 	sumConcurrences   float64
 	sumConcurrencesOf []float64
-	meanConcurrenceOf []float64
-	varConcurrenceOf  []float64
-
-	// ------------------------------------------------------------------------
-	// thresholds for pair selection sparsity
-	//	balanceThreshold: a threshold in (0, 1) to filter pairs by nodewise freq
-	//		balance.
-	//	concurrenceThreshold: a threshold > 0.0 to filter pairs by edgewise freq.
-	balanceThreshold     float64
-	concurrenceThreshold float64
-
-	// ------------------------------------------------------------------------
-	// the selected pairs
-	pairs    map[UintPair]uint
-	numPairs uint
 }
 
 // =============================================================================
 // func NewConcurrenceModel
 // brief description: create a new ConcurrenceModel object
-func NewConcurrenceModel() ConcurrenceModel {
+func NewConcurrenceModel(neighbors [][]int, sims [][]float64, cardinalities []int) ConcurrenceModel {
+	n := len(neighbors)
+	if n != len(sims) || n != len(cardinalities) {
+		log.Fatalln("input size don't match in NewConcurrenceModel")
+	}
+	concurrences := make([]map[int]float64, n)
+	for i := 0; i < n; i++ {
+		if len(neighbors[i]) != len(sims[i]) {
+			log.Fatalln(fmt.Sprintf("len(neighbors[%d]) = %d != len(sims[%d]) = %d",
+				i, len(neighbors[i]), i, len(sims[i])))
+		}
+		concurrences[i] = map[int]float64{}
+		for j := 0; j < len(sims[i]); j++ {
+			neighbor := neighbors[i][j]
+			if neighbor == i {
+				continue
+			}
+			concurrences[i][neighbor] = sims[i][j]
+		}
+	}
+	sumConcurrencesOf := GetSumConcurrencesOf(concurrences, cardinalities)
+	sumConcurrences := 0.0
+	for i := 0; i < n; i++ {
+		sumConcurrences += sumConcurrencesOf[i]
+	}
 	return ConcurrenceModel{
-		n:                    0,
-		concurrences:         map[uint]map[uint]float64{},
-		sumConcurrences:      0.0,
-		sumConcurrencesOf:    []float64{},
-		meanConcurrenceOf:    []float64{},
-		varConcurrenceOf:     []float64{},
-		balanceThreshold:     0.1,
-		concurrenceThreshold: 5.0,
-	}
-}
-
-// =============================================================================
-// func verifyConcurrences
-// brief description: check whether the concurrences are valid.
-// input:
-//	n: the number of nodes
-//	concurrences: a matrix that its element (i,j) is the frequency of the
-//		concurrence of node i and node j. If no such concurrence exists, then
-//		the	element is 0.
-// output:
-//	nothing, but will raise fatal exceptions otherwise.
-func verifyConcurrences(n uint, concurrences map[uint]map[uint]float64) {
-	maxNodeID := uint(0)
-	for u, weightsOfU := range concurrences {
-		if u > maxNodeID {
-			maxNodeID = u
-		}
-		for v, weightUV := range weightsOfU {
-			if v > maxNodeID {
-				maxNodeID = v
-			}
-			weightsOfV, exists := concurrences[v]
-			if !exists {
-				log.Fatalln("Asymmetric concurrence")
-			}
-			weightVU, exists := weightsOfV[u]
-			if !exists || weightVU != weightUV {
-				log.Fatalln("Asymmetric concurrence")
-			}
-		}
-	}
-	if maxNodeID >= n {
-		log.Fatalln("maxNodeID >= n")
+		n:                 n,
+		concurrences:      concurrences,
+		cardinalities:     cardinalities,
+		sumConcurrences:   sumConcurrences,
+		sumConcurrencesOf: sumConcurrencesOf,
 	}
 }
 
@@ -166,18 +136,19 @@ func verifyConcurrences(n uint, concurrences map[uint]map[uint]float64) {
 //		then the element is 0.
 // output:
 //	the vector mentioned in brief description.
-func GetSumConcurrencesOf(n uint, concurrences map[uint]map[uint]float64,
-) []float64 {
+func GetSumConcurrencesOf(concurrences []map[int]float64, cardinalities []int) []float64 {
 	// -------------------------------------------------------------------------
 	// step 1:
+	n := len(concurrences)
+	if n != len(cardinalities) {
+		log.Fatalln("lengthes of concurrences and cardinalities don't match")
+	}
 	sumConcurrencesOf := make([]float64, n)
-	for u := uint(0); u < n; u++ {
+	for u := 0; u < n; u++ {
 		mySum := 0.0
-		weightsOfU, exists := concurrences[u]
-		if exists {
-			for _, weightUV := range weightsOfU {
-				mySum += weightUV
-			}
+		weightsOfU := concurrences[u]
+		for v, weightUV := range weightsOfU {
+			mySum += weightUV * float64(cardinalities[u]*cardinalities[v])
 		}
 		sumConcurrencesOf[u] = mySum
 	}
@@ -188,114 +159,8 @@ func GetSumConcurrencesOf(n uint, concurrences map[uint]map[uint]float64,
 }
 
 // =============================================================================
-// func (cm *ConcurrenceModel) SetPairFilter
-// brief description: set the thresholds to filter pair selections to ensure
-//	pair sparsity.
-// input:
-//	balanceThreshold: a threshold in (0, 1) to filter pairs by nodewise freq
-//		balance.
-//	concurrenceThreshold: a threshold > 0.0 to filter pairs by edgewise freq.
-// output:
-//	nothing.
-func (cm *ConcurrenceModel) SetPairFilter(balanceThreshold float64,
-	concurrenceThreshold float64) {
-	if balanceThreshold <= 0.0 || balanceThreshold >= 1.0 {
-		log.Fatalln("balanceThreshold must be in (0,1).")
-	}
-	if concurrenceThreshold <= 0.0 {
-		log.Fatalln("concurrenceThreshold must be > 0.")
-	}
-	cm.balanceThreshold = balanceThreshold
-	cm.concurrenceThreshold = concurrenceThreshold
-	cm.filterPairs()
-}
-
-// =============================================================================
-// func (cm *ConcurrenceModel) SetExclusions
-// brief description: set the exclusions of cm to avoid computing similarities between excluded
-//	pairs
-// input:
-//	exclusions: the map of exclusions
-// output:
-//	nothing.
-func (cm *ConcurrenceModel) SetExclusions(exclusions map[uint]map[uint]bool) {
-	cm.exclusions = exclusions
-}
-
-// =============================================================================
-// func (cm *ConcurrenceModel) SetConcurrences
-// brief description: set the concurrences of cm
-// input:
-//	n: the number of nodes
-//	concurrence: a matrix that its element (i,j) is the frequency of the concurrence
-//		between node i and node j. If no such concurrence exists, then the
-//		element is 0.
-// output:
-//	nothing.
-func (cm *ConcurrenceModel) SetConcurrences(n uint,
-	concurrences map[uint]map[uint]float64) {
-	// -------------------------------------------------------------------------
-	// step 1: check whether the concurrences are valid.
-	verifyConcurrences(n, concurrences)
-
-	// -------------------------------------------------------------------------
-	// step 2: get the nodewise sum of weights
-	sumConcurrencesOf := GetSumConcurrencesOf(n, concurrences)
-
-	// -------------------------------------------------------------------------
-	// step 3: compute the sum of all weights
-	sumConcurrences := 0.0
-	for _, value := range sumConcurrencesOf {
-		sumConcurrences += value
-	}
-
-	// -------------------------------------------------------------------------
-	// step 4: compute the nodewise mean of weights
-	meanConcurrenceOf := make([]float64, n)
-	for u := uint(0); u < n; u++ {
-		if sumConcurrencesOf[u] == 0 {
-			meanConcurrenceOf[u] = 0.0
-		} else {
-			meanConcurrenceOf[u] = float64(sumConcurrencesOf[u]) / float64(len(concurrences[u]))
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 5: compute the nodewise variance of weights
-	varConcurrenceOf := make([]float64, n)
-	for u := uint(0); u < n; u++ {
-		if sumConcurrencesOf[u] == 0 {
-			varConcurrenceOf[u] = 1e-32
-		} else {
-			varConcurrenceOf[u] = 0.0
-			for _, weightUV := range concurrences[u] {
-				diffFromMean := float64(weightUV) - meanConcurrenceOf[u]
-				varConcurrenceOf[u] += diffFromMean * diffFromMean
-			}
-			varConcurrenceOf[u] /= float64(len(concurrences[u]))
-			if varConcurrenceOf[u] < 1e-32 {
-				varConcurrenceOf[u] = 1e-32
-			}
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 6: set the fields
-	cm.n = n
-	cm.sumConcurrences = sumConcurrences
-	cm.sumConcurrencesOf = sumConcurrencesOf
-	cm.meanConcurrenceOf = meanConcurrenceOf
-	cm.varConcurrenceOf = varConcurrenceOf
-	cm.concurrences = concurrences
-
-	// -------------------------------------------------------------------------
-	// step 7: filter the pairs
-	cm.filterPairs()
-}
-
-// =============================================================================
 // func (cm ConcurrenceModel) GetN
-func (cm ConcurrenceModel) GetN() uint {
+func (cm ConcurrenceModel) GetN() int {
 	return cm.n
 }
 
@@ -306,29 +171,8 @@ func (cm ConcurrenceModel) GetN() uint {
 //	i: a point ID
 // output:
 //	the frequency of the concurrence of i if exists, 0 otherwise
-func (cm ConcurrenceModel) GetConcurrencesOf(i uint) map[uint]float64 {
-	weightsOfI, exists := cm.concurrences[i]
-	if exists {
-		return weightsOfI
-	} else {
-		return map[uint]float64{}
-	}
-}
-
-// =============================================================================
-// func (cm ConcurrenceModel) GetExclusionsOf
-// brief description: get the exclusions related to a node
-// input:
-//	i: a point ID
-// output:
-//	the frequency of the concurrence of i if exists, 0 otherwise
-func (cm ConcurrenceModel) GetExclusionsOf(i uint) map[uint]bool {
-	exclusionsOfI, exists := cm.exclusions[i]
-	if exists {
-		return exclusionsOfI
-	} else {
-		return map[uint]bool{}
-	}
+func (cm ConcurrenceModel) GetConcurrencesOf(i int) map[int]float64 {
+	return cm.concurrences[i]
 }
 
 // =============================================================================
@@ -339,60 +183,13 @@ func (cm ConcurrenceModel) GetExclusionsOf(i uint) map[uint]bool {
 // output:
 //	the frequency of the concurrence between i and j if the edge exists, 0
 //	otherwise
-func (cm ConcurrenceModel) GetConcurrence(i, j uint) float64 {
-	weightIJ, exists := cm.GetConcurrencesOf(i)[j]
+func (cm ConcurrenceModel) GetConcurrence(i, j int) float64 {
+	weightIJ, exists := cm.concurrences[i][j]
 	if exists {
 		return weightIJ
 	} else {
 		return 0.0
 	}
-}
-
-// =============================================================================
-// func (cm ConcurrenceModel) GetCompleteCommunties
-// brief description: first copy input communites to the result, then add all
-//	isolated points into the result as single point communities.
-// input:
-//	communities: a list of clusters.
-// output:
-//	the complete communities with isolated points added as single point
-//	communities.
-func (cm ConcurrenceModel) GetCompleteCommunities(communities []map[uint]bool,
-) []map[uint]bool {
-	// -------------------------------------------------------------------------
-	// step 1: copy the communties into the result and mark the points in the
-	// communities.
-	result := []map[uint]bool{}
-	pointMarkers := make([]bool, cm.n)
-	for i := uint(0); i < cm.n; i++ {
-		pointMarkers[i] = false
-	}
-	for _, community := range communities {
-		myCommunity := map[uint]bool{}
-		for point, _ := range community {
-			if point >= cm.n {
-				log.Fatal(fmt.Sprintf("point %d > n = %d", point, cm.n))
-			}
-			if pointMarkers[point] {
-				log.Fatal(fmt.Sprintf("point %d is in multiple communities", point))
-			}
-			myCommunity[point] = true
-			pointMarkers[point] = true
-		}
-		result = append(result, myCommunity)
-	}
-
-	// -------------------------------------------------------------------------
-	// step 2: add isolated points into the result as single point communities
-	for i := uint(0); i < cm.n; i++ {
-		if !pointMarkers[i] {
-			result = append(result, map[uint]bool{i: true})
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 3: return the result
-	return result
 }
 
 // =============================================================================
@@ -402,32 +199,31 @@ func (cm ConcurrenceModel) GetCompleteCommunities(communities []map[uint]bool,
 //	communities: a list of clusters.
 // output:
 //	the aggregated ConcurrenceModel
-func (cm ConcurrenceModel) Aggregate(communities []map[uint]bool,
-) ConcurrenceModel {
+func (cm ConcurrenceModel) Aggregate(communities []map[int]bool) ConcurrenceModel {
 	// -------------------------------------------------------------------------
 	// step 1: set newN and create an empty newConcurrences
-	newN := uint(len(communities))
-	newConcurrences := map[uint]map[uint]float64{}
-	for i := uint(0); i < newN; i++ {
-		newConcurrences[i] = map[uint]float64{}
+	newN := len(communities)
+	newConcurrences := make([]map[int]float64, newN)
+	newCardinalities := make([]int, newN)
+	for i := 0; i < newN; i++ {
+		newConcurrences[i] = map[int]float64{}
+		newCardinalities[i] = 1
 	}
 
 	// -------------------------------------------------------------------------
 	// step 2: scans through the communities to fill newConcurrences
-	for i1 := uint(0); i1+1 < newN; i1++ {
+	for i1 := 0; i1+1 < newN; i1++ {
 		c1 := communities[i1]
 		for i2 := i1 + 1; i2 < newN; i2++ {
 			c2 := communities[i2]
 			weightI1I2 := 0.0
 			for pt1, _ := range c1 {
-				weightsOfPt1, exists := cm.concurrences[pt1]
-				if !exists {
-					continue
-				}
+				weightsOfPt1 := cm.concurrences[pt1]
 				for pt2, _ := range c2 {
 					weightPt1Pt2, exists := weightsOfPt1[pt2]
 					if exists {
-						weightI1I2 += weightPt1Pt2
+						weightI1I2 += weightPt1Pt2 *
+							float64(cm.cardinalities[pt1]*cm.cardinalities[pt2])
 					}
 				}
 			}
@@ -440,344 +236,22 @@ func (cm ConcurrenceModel) Aggregate(communities []map[uint]bool,
 
 	// -------------------------------------------------------------------------
 	// step 3: create a new ConcurrenceModel using these data
-	newCM := NewConcurrenceModel()
-	newCM.SetConcurrences(newN, newConcurrences)
+	newSumConcurrencesOf := GetSumConcurrencesOf(newConcurrences, newCardinalities)
+	newSumConcurrences := 0.0
+	for i := 0; i < cm.n; i++ {
+		newSumConcurrences += newSumConcurrencesOf[i]
+	}
+	newCM := ConcurrenceModel{
+		n:                 newN,
+		concurrences:      newConcurrences,
+		cardinalities:     newCardinalities,
+		sumConcurrences:   newSumConcurrences,
+		sumConcurrencesOf: newSumConcurrencesOf,
+	}
 
 	// -------------------------------------------------------------------------
 	// step 4: return the new ConcurrenceModel
 	return newCM
-}
-
-// =============================================================================
-// func (cm ConcurrenceModel) InduceSimilarities
-// brief description: induce similarities from concurrences.
-// input:
-//	nothing
-// output:
-//	A similarity matrix induced from concurrences.
-func (cm ConcurrenceModel) InduceSimilarities() map[uint]map[uint]float64 {
-	simMat := map[uint]map[uint]float64{}
-	for u := uint(0); u < cm.n; u++ {
-		row := map[uint]float64{u: 1.0}
-		cu := 0.5 / cm.sumConcurrencesOf[u]
-		weightsOfU := cm.GetConcurrencesOf(u)
-		exclusionsOfU := cm.GetExclusionsOf(u)
-		if len(weightsOfU) == 0 {
-			continue
-		}
-		for v, weightUV := range weightsOfU {
-			_, excluded := exclusionsOfU[v]
-			if !excluded {
-				cv := 0.5 / cm.sumConcurrencesOf[v]
-				row[v] = weightUV * (cu + cv)
-			}
-		}
-		simMat[u] = row
-	}
-	return simMat
-}
-
-// =============================================================================
-// func (cm ConcurrenceModel) InduceNormalizedSimilarities
-// brief description: induce normalized similarities from concurrences.
-// input:
-//	nothing
-// output:
-//	A similarity matrix induced from concurrences.
-// note:
-//	A normalized similarity is 0.5 if the weight is the mean of concurrence,
-func (cm ConcurrenceModel) InduceNormalizedSimilarities() map[uint]map[uint]float64 {
-	simMat := map[uint]map[uint]float64{}
-	for u := uint(0); u < cm.n; u++ {
-		row := map[uint]float64{u: 1.0}
-		weightsOfU := cm.GetConcurrencesOf(u)
-		exclusionsOfU := cm.GetExclusionsOf(u)
-		for v, weightUV := range weightsOfU {
-			_, excluded := exclusionsOfU[v]
-			if !excluded {
-				normalizedWeightU := math.Erf((float64(weightUV) - cm.meanConcurrenceOf[u]) /
-					cm.varConcurrenceOf[u])
-				normalizedWeightV := math.Erf((float64(weightUV) - cm.meanConcurrenceOf[v]) /
-					cm.varConcurrenceOf[v])
-				row[v] = 0.5 * (normalizedWeightU + normalizedWeightV)
-			}
-		}
-		simMat[u] = row
-	}
-	return simMat
-}
-
-// =============================================================================
-// func (cm ConcurrenceModel) InduceJaccardSimilarities
-// brief description: compute the induced Jaccard Similarities from concurrences
-// input:
-//	nothing
-// output:
-//	A Jaccard similarity matrix induced from concurrences
-func (cm ConcurrenceModel) InduceJaccardSimilarities() map[uint]map[uint]float64 {
-	simMat := map[uint]map[uint]float64{}
-	lock := sync.RWMutex{}
-	numCPUs := runtime.NumCPU()
-	chU := make(chan uint)
-	chWorkers := make(chan bool)
-	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
-		go func() {
-			mySimMat := map[uint]map[uint]float64{}
-			for u0 := range chU {
-				u1 := u0 + 100
-				if u1 > cm.n {
-					u1 = cm.n
-				}
-				for u := u0; u < u1; u++ {
-					row := map[uint]float64{u: 1.0}
-					mySimMat[u] = row
-					weightsOfU := cm.GetConcurrencesOf(u)
-					exclusionsOfU := cm.GetExclusionsOf(u)
-					for v, _ := range weightsOfU {
-						_, excluded := exclusionsOfU[v]
-						if !excluded {
-							weightsOfV := cm.GetConcurrencesOf(v)
-
-							// compute the size of intersection of neighborU and neighborV
-							numInIntersection := 0
-							if len(weightsOfU) < len(weightsOfV) {
-								for neighborU, _ := range weightsOfU {
-									_, isNeighborV := weightsOfV[neighborU]
-									if isNeighborV {
-										numInIntersection++
-									}
-								}
-							} else {
-								for neighborV, _ := range weightsOfV {
-									_, isNeighborU := weightsOfU[neighborV]
-									if isNeighborU {
-										numInIntersection++
-									}
-								}
-							}
-
-							// skip if it is an empty intersection
-							if numInIntersection == 0 {
-								continue
-							}
-
-							// compute the size of union of neighborU and neighborV
-							numInUnion := len(weightsOfU) + len(weightsOfV) - numInIntersection
-
-							// compute the similarity of u and v
-							row[v] = float64(numInIntersection) / float64(numInUnion)
-						}
-					}
-				}
-			}
-
-			lock.Lock()
-			for u, row := range mySimMat {
-				simMat[u] = row
-			}
-			lock.Unlock()
-
-			chWorkers <- true
-		}()
-	}
-
-	for u := uint(0); u < cm.n; u += 100 {
-		chU <- u
-	}
-	close(chU)
-	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
-		<-chWorkers
-	}
-
-	return simMat
-}
-
-// =============================================================================
-// func (cm ConcurrenceModel) InduceWeightedJaccardSimilarities
-// brief description: compute the induced weighted Jaccard Similarities from
-//	concurrences
-// input:
-//	nothing
-// output:
-//	A weighted Jaccard similarity matrix induced from concurrences
-func (cm ConcurrenceModel) InduceWeightedJaccardSimilarities() map[uint]map[uint]float64 {
-	simMat := map[uint]map[uint]float64{}
-	lock := sync.RWMutex{}
-	numCPUs := runtime.NumCPU()
-	chU := make(chan uint)
-	chWorkers := make(chan bool)
-	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
-		go func() {
-			mySimMat := map[uint]map[uint]float64{}
-			for u0 := range chU {
-				u1 := u0 + 100
-				if u1 > cm.n {
-					u1 = cm.n
-				}
-				for u := u0; u < u1; u++ {
-					row := map[uint]float64{u: 1.0}
-					mySimMat[u] = row
-					weightsOfU := cm.GetConcurrencesOf(u)
-					exclusionsOfU := cm.GetExclusionsOf(u)
-					if len(weightsOfU) == 0 {
-						continue
-					}
-					cu := 1.0 / float64(cm.sumConcurrencesOf[u])
-					for v, _ := range weightsOfU {
-						_, excluded := exclusionsOfU[v]
-						if !excluded {
-							weightsOfV := cm.GetConcurrencesOf(v)
-							cv := 1.0 / float64(cm.sumConcurrencesOf[v])
-
-							// compute the weighted size of intersection of neighborU and neighborV
-							sumWeightInIntersection := 0.0
-							if len(weightsOfU) < len(weightsOfV) {
-								for neighborU, weightAtU := range weightsOfU {
-									weightAtV, isNeighborV := weightsOfV[neighborU]
-									if isNeighborV {
-										sumWeightInIntersection += float64(weightAtU*weightAtV) * cu * cv
-									}
-								}
-							} else {
-								for neighborV, weightAtV := range weightsOfV {
-									weightAtU, isNeighborU := weightsOfU[neighborV]
-									if isNeighborU {
-										sumWeightInIntersection += float64(weightAtU*weightAtV) * cu * cv
-									}
-								}
-							}
-
-							// compute the similarity of u and v
-							row[v] = sumWeightInIntersection
-						}
-					}
-				}
-			}
-
-			lock.Lock()
-			for u, row := range mySimMat {
-				simMat[u] = row
-			}
-			lock.Unlock()
-
-			chWorkers <- true
-		}()
-	}
-
-	for u := uint(0); u < cm.n; u += 100 {
-		chU <- u
-	}
-	close(chU)
-	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
-		<-chWorkers
-	}
-
-	return simMat
-}
-
-// =============================================================================
-// func (cm ConcurrenceModel) InduceNormalizedJaccardSimilarities
-// brief description: compute the induced weighted Jaccard Similarities from
-//	concurrences
-// input:
-//	nothing
-// output:
-//	A weighted Jaccard similarity matrix induced from concurrences
-func (cm ConcurrenceModel) InduceNormalizedJaccardSimilarities() map[uint]map[uint]float64 {
-	simMat := map[uint]map[uint]float64{}
-	sumNormalizedWeightsOf := make([]float64, cm.n)
-	for u := uint(0); u < cm.n; u++ {
-		sumNormalizedWeightsOf[u] = 0.0
-		weightsOfU := cm.GetConcurrencesOf(u)
-		for _, weight := range weightsOfU {
-			sumNormalizedWeightsOf[u] += math.Erf((float64(weight) - cm.meanConcurrenceOf[u]) /
-				cm.varConcurrenceOf[u])
-		}
-	}
-
-	lock := sync.RWMutex{}
-	numCPUs := runtime.NumCPU()
-	chU := make(chan uint)
-	chWorkers := make(chan bool)
-	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
-		go func() {
-			mySimMat := map[uint]map[uint]float64{}
-			for u0 := range chU {
-				u1 := u0 + 100
-				if u1 > cm.n {
-					u1 = cm.n
-				}
-				for u := u0; u < u1; u++ {
-					row := map[uint]float64{u: 1.0}
-					mySimMat[u] = row
-					weightsOfU := cm.GetConcurrencesOf(u)
-					exclusionsOfU := cm.GetExclusionsOf(u)
-					if len(weightsOfU) == 0 || sumNormalizedWeightsOf[u] == 0.0 {
-						continue
-					}
-					cu := 1.0 / sumNormalizedWeightsOf[u]
-					for v, _ := range weightsOfU {
-						_, excluded := exclusionsOfU[v]
-						if !excluded {
-							weightsOfV := cm.GetConcurrencesOf(v)
-							if len(weightsOfV) == 0 || sumNormalizedWeightsOf[v] == 0.0 {
-								continue
-							}
-							cv := 1.0 / sumNormalizedWeightsOf[v]
-
-							// compute the weighted size of intersection of neighborU and neighborV
-							sumWeightInIntersection := 0.0
-							if len(weightsOfU) < len(weightsOfV) {
-								for neighborU, weightAtU := range weightsOfU {
-									weightAtV, isNeighborV := weightsOfV[neighborU]
-									if isNeighborV {
-										wu := cu * math.Erf((float64(weightAtU)-cm.meanConcurrenceOf[u])/
-											cm.varConcurrenceOf[u])
-										wv := cv * math.Erf((float64(weightAtV)-cm.meanConcurrenceOf[v])/
-											cm.varConcurrenceOf[v])
-										sumWeightInIntersection += wu * wv
-
-									}
-								}
-							} else {
-								for neighborV, weightAtV := range weightsOfV {
-									weightAtU, isNeighborU := weightsOfU[neighborV]
-									if isNeighborU {
-										wu := cu * math.Erf((float64(weightAtU)-cm.meanConcurrenceOf[u])/
-											cm.varConcurrenceOf[u])
-										wv := cv * math.Erf((float64(weightAtV)-cm.meanConcurrenceOf[v])/
-											cm.varConcurrenceOf[v])
-										sumWeightInIntersection += wu * wv
-									}
-								}
-							}
-
-							// compute the similarity of u and v
-							row[v] = sumWeightInIntersection
-						}
-					}
-				}
-			}
-
-			lock.Lock()
-			for u, row := range mySimMat {
-				simMat[u] = row
-			}
-			lock.Unlock()
-
-			chWorkers <- true
-		}()
-	}
-
-	for u := uint(0); u < cm.n; u += 100 {
-		chU <- u
-	}
-	close(chU)
-	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
-		<-chWorkers
-	}
-
-	return simMat
 }
 
 // =============================================================================
@@ -787,7 +261,7 @@ func (cm ConcurrenceModel) InduceNormalizedJaccardSimilarities() map[uint]map[ui
 //	u, v: two node IDs
 // output:
 //	true if it connects them, false otherwise
-func (cm ConcurrenceModel) Connects(u, v uint) bool {
+func (cm ConcurrenceModel) Connects(u, v int) bool {
 	return cm.GetConcurrence(u, v) > 0.0
 }
 
@@ -801,11 +275,10 @@ func (cm ConcurrenceModel) Connects(u, v uint) bool {
 //	r: a threshold
 // output:
 //	true if it connects well, false otherwise
-func (cm ConcurrenceModel) ConnectsWell(subset, set map[uint]bool, r float64,
-) bool {
+func (cm ConcurrenceModel) ConnectsWell(subset, set map[int]bool, r float64) bool {
 	// -------------------------------------------------------------------------
 	// step 1: find the complement of subset in set
-	complement := map[uint]bool{}
+	complement := map[int]bool{}
 	for v, _ := range set {
 		_, inSubset := subset[v]
 		if inSubset {
@@ -818,18 +291,28 @@ func (cm ConcurrenceModel) ConnectsWell(subset, set map[uint]bool, r float64,
 	// step 2: sum the weights between the subset and the complement
 	x := 0.0
 	for u, _ := range subset {
-		weightsOfU := cm.GetConcurrencesOf(u)
+		weightsOfU := cm.concurrences[u]
 		for v, _ := range complement {
 			weightUV, exists := weightsOfU[v]
 			if exists {
-				x += weightUV
+				x += weightUV * float64(cm.cardinalities[u]*cm.cardinalities[v])
 			}
 		}
 	}
 
+	// step 3: sum the cardinalities of the set and the subset
+	card0 := 0
+	for u, _ := range set {
+		card0 += cm.cardinalities[u]
+	}
+	card1 := 0
+	for u, _ := range subset {
+		card1 += cm.cardinalities[u]
+	}
+
 	// -------------------------------------------------------------------------
-	// step 3: return the result
-	return x >= r*float64(len(subset)*len(complement))
+	// step 4: return the result
+	return x >= r*float64(card0*card1)
 }
 
 // =============================================================================
@@ -839,19 +322,19 @@ type QualityModel interface {
 	// The first four methods are parts of ConcurrenceModel. Therefore, for
 	// those structs merged with ConcurreneModel, they already have these four
 	// methods
-	GetN() uint
-	GetCompleteCommunities(communities []map[uint]bool) []map[uint]bool
-	ConnectsWell(subset, set map[uint]bool, r float64) bool
-	Connects(u, v uint) bool
+	GetN() int
+	ConnectsWell(subset, set map[int]bool, r float64) bool
+	Connects(u, v int) bool
+	GetNeighbors(u int) map[int]float64
 
 	// This method is simiar to that of ConcurrenceModel. The difference is the
 	// return value.
-	Aggregate(communities []map[uint]bool) QualityModel
+	Aggregate(communities []map[int]bool) QualityModel
 
 	// The last two methods are new to QualityModel. The implementations of this
 	// interface must implement them.
-	Quality(communities []map[uint]bool) float64
-	DeltaQuality(communities []map[uint]bool, u, oldCu, newCu uint) float64
+	Quality(communities []map[int]bool) float64
+	DeltaQuality(communities []map[int]bool, u, oldCu, newCu int) float64
 }
 
 // =============================================================================
@@ -868,16 +351,16 @@ type Modularity struct {
 // brief description: create a new Modularity
 // input:
 //	r: a threshold of modularity
-func NewModularity(r float64) Modularity {
+func NewModularity(r float64, cm ConcurrenceModel) Modularity {
 	return Modularity{
 		r:                r,
-		ConcurrenceModel: NewConcurrenceModel(),
+		ConcurrenceModel: cm,
 	}
 }
 
 // =============================================================================
 // func (qm *Modularity) Aggregate
-func (qm Modularity) Aggregate(communities []map[uint]bool) QualityModel {
+func (qm Modularity) Aggregate(communities []map[int]bool) QualityModel {
 	return QualityModel(Modularity{qm.r, qm.ConcurrenceModel.Aggregate(communities)})
 }
 
@@ -888,7 +371,7 @@ func (qm Modularity) Aggregate(communities []map[uint]bool) QualityModel {
 //	communities: a list of clusters.
 // output:
 //	the value of Modularity
-func (qm Modularity) Quality(communities []map[uint]bool) float64 {
+func (qm Modularity) Quality(communities []map[int]bool) float64 {
 	// -------------------------------------------------------------------------
 	// step 1: compute 1/m and r/m
 	oneOverM := 1.0 / float64(qm.sumConcurrences)
@@ -906,10 +389,14 @@ func (qm Modularity) Quality(communities []map[uint]bool) float64 {
 	result := 0.0
 	for _, c := range communities {
 		for i, _ := range c {
-			ki := float64(qm.sumConcurrencesOf[i])
+			ki := qm.sumConcurrencesOf[i]
 			for j, _ := range c {
-				kj := float64(qm.sumConcurrencesOf[j])
-				result += float64(qm.GetConcurrence(i, j)) - rOverM*ki*kj
+				if i == j {
+					continue
+				}
+				kj := qm.sumConcurrencesOf[j]
+				result += qm.GetConcurrence(i, j)*float64(qm.cardinalities[i]*qm.cardinalities[j]) -
+					rOverM*ki*kj
 			}
 		}
 	}
@@ -932,8 +419,7 @@ func (qm Modularity) Quality(communities []map[uint]bool) float64 {
 //	The change amount of modularity.
 // output:
 //	the value of Modularity
-func (qm Modularity) DeltaQuality(communities []map[uint]bool,
-	u, oldCu, newCu uint) float64 {
+func (qm Modularity) DeltaQuality(communities []map[int]bool, u, oldCu, newCu int) float64 {
 	// -------------------------------------------------------------------------
 	// step 1: check whether oldCu and newCu are the same one.
 	// no change if oldCu == newCu
@@ -943,7 +429,7 @@ func (qm Modularity) DeltaQuality(communities []map[uint]bool,
 
 	// -------------------------------------------------------------------------
 	// step 2: compute 1/m and r/m
-	oneOverM := 1.0 / float64(qm.sumConcurrences)
+	oneOverM := 1.0 / qm.sumConcurrences
 	rOverM := qm.r * oneOverM
 
 	// -------------------------------------------------------------------------
@@ -961,23 +447,23 @@ func (qm Modularity) DeltaQuality(communities []map[uint]bool,
 	//	- 1/m sum_{j in community oldCu, j != i} (w_{u,j} - k_u * k_j * r/m)
 	// (3.1) fetch weights of u and k_u
 	weightsOfU := qm.GetConcurrencesOf(u)
-	ku := float64(qm.sumConcurrencesOf[u])
+	ku := qm.sumConcurrencesOf[u]
 
 	// (3.2) add to result the change at the new community of u
 	result := 0.0
 	newCommunityOfU := communities[newCu]
-	for j := range newCommunityOfU {
+	for j, _ := range newCommunityOfU {
 		weightUJ, exists := weightsOfU[j]
 		if !exists {
 			weightUJ = 0.0
 		}
-		kj := float64(qm.sumConcurrencesOf[j])
-		result += float64(weightUJ) - rOverM*ku*kj
+		kj := qm.sumConcurrencesOf[j]
+		result += weightUJ*float64(qm.cardinalities[u]*qm.cardinalities[j]) - rOverM*ku*kj
 	}
 
 	// (3.3) subtract from result the change at the old community of u
 	oldCommunityOfU := communities[oldCu]
-	for j := range oldCommunityOfU {
+	for j, _ := range oldCommunityOfU {
 		if j == u {
 			continue
 		}
@@ -985,8 +471,8 @@ func (qm Modularity) DeltaQuality(communities []map[uint]bool,
 		if !exists {
 			weightUJ = 0.0
 		}
-		kj := float64(qm.sumConcurrencesOf[j])
-		result -= float64(weightUJ) - rOverM*ku*kj
+		kj := qm.sumConcurrencesOf[j]
+		result -= weightUJ*float64(qm.cardinalities[u]*qm.cardinalities[j]) - rOverM*ku*kj
 	}
 	result *= oneOverM
 
@@ -1004,21 +490,29 @@ type CPM struct {
 	ConcurrenceModel
 }
 
+func (qm CPM) GetNeighbors(u int) map[int]float64 {
+	return qm.concurrences[u]
+}
+
 // =============================================================================
 // func NewCPM
 // brief description: create a new CPM
 // input:
 //	r: a threshold of CPM
-func NewCPM(r float64) CPM {
+func NewCPM(r float64, cm ConcurrenceModel) CPM {
 	return CPM{
 		r:                r,
-		ConcurrenceModel: NewConcurrenceModel(),
+		ConcurrenceModel: cm,
 	}
+}
+
+func (qm Modularity) GetNeighbors(u int) map[int]float64 {
+	return qm.concurrences[u]
 }
 
 // =============================================================================
 // func (qm CPM) Aggregate
-func (qm CPM) Aggregate(communities []map[uint]bool) QualityModel {
+func (qm CPM) Aggregate(communities []map[int]bool) QualityModel {
 	return QualityModel(CPM{qm.r, qm.ConcurrenceModel.Aggregate(communities)})
 }
 
@@ -1029,7 +523,7 @@ func (qm CPM) Aggregate(communities []map[uint]bool) QualityModel {
 //	communities: a list of clusters.
 // output:
 //	the value of Modularity
-func (qm CPM) Quality(communities []map[uint]bool) float64 {
+func (qm CPM) Quality(communities []map[int]bool) float64 {
 	// -------------------------------------------------------------------------
 	// step 1: compute CPM using the following equation:
 	// CPM = sum_c (w_c - r size_c^2),
@@ -1039,7 +533,10 @@ func (qm CPM) Quality(communities []map[uint]bool) float64 {
 	//	w_c is the sum of weight(i,j) for all i, j in c.
 	result := 0.0
 	for _, c := range communities {
-		sizeC := float64(len(c))
+		sizeC := 0
+		for i, _ := range c {
+			sizeC += qm.cardinalities[i]
+		}
 
 		sumWeightsOfC := 0.0
 		for i, _ := range c {
@@ -1047,12 +544,12 @@ func (qm CPM) Quality(communities []map[uint]bool) float64 {
 			for j, _ := range c {
 				weightIJ, exists := weightsOfI[j]
 				if exists {
-					sumWeightsOfC += float64(weightIJ)
+					sumWeightsOfC += weightIJ * float64(qm.cardinalities[i]*qm.cardinalities[j])
 				}
 			}
 		}
 
-		result += sumWeightsOfC - qm.r*sizeC*sizeC
+		result += sumWeightsOfC - qm.r*float64(sizeC*sizeC)
 	}
 
 	// -------------------------------------------------------------------------
@@ -1072,8 +569,7 @@ func (qm CPM) Quality(communities []map[uint]bool) float64 {
 //	The change amount of modularity.
 // output:
 //	the value of Modularity
-func (qm CPM) DeltaQuality(communities []map[uint]bool,
-	u, oldCu, newCu uint) float64 {
+func (qm CPM) DeltaQuality(communities []map[int]bool, u, oldCu, newCu int) float64 {
 	// -------------------------------------------------------------------------
 	// step 1: check whether oldCu and newCu are the same one.
 	// no change if oldCu == newCu
@@ -1090,44 +586,45 @@ func (qm CPM) DeltaQuality(communities []map[uint]bool,
 	//	w_c is the sum of weight(i,j) for all i, j in c.
 	// Therefore:
 	// delta CPM = delta w_oldCu + delta w_newCu
-	//	- r ((size_oldCu-1)^2 - size_oldCu^2)
-	//	- r ((size_newCu+1)^2 - size_newCu^2)
-	//	= delta w_oldCu + delta w_newCu - r (-2 size_oldCu + 1)
-	//	- r (2 size_newCu + 1)
-	//	= delta w_oldCu + delta w_newCu - 2 r(size_newCu - size_oldCu + 1)
+	//	- r ((size_oldCu-card)^2 - size_oldCu^2)
+	//	- r ((size_newCu+card)^2 - size_newCu^2)
+	//	= delta w_oldCu + delta w_newCu - r (-2 size_oldCu * card + card^2)
+	//	- r (2 size_newCu * card + card^2)
+	//	= delta w_oldCu + delta w_newCu - 2 r * card * (size_newCu - size_oldCu + card)
 
-	// (2.1) fetch weights of u
+	// (2.1) fetch weights and card of u
 	weightsOfU := qm.GetConcurrencesOf(u)
+	cardU := qm.cardinalities[u]
 
-	// (2.2) compute delta w_oldCu
+	// (2.2) compute delta w_oldCu and sizeOldCu
 	deltaWOldCu := 0.0
+	sizeOldCu := 0
 	oldCommunityOfU := communities[oldCu]
-	for j := range oldCommunityOfU {
+	for j, _ := range oldCommunityOfU {
+		sizeOldCu += qm.cardinalities[j]
 		if j == u {
 			continue
 		}
 		weightUJ, exists := weightsOfU[j]
 		if exists {
-			deltaWOldCu -= float64(weightUJ)
+			deltaWOldCu -= weightUJ * float64(cardU*qm.cardinalities[j])
 		}
 	}
 
-	// (2.3) compute delta w_newCu
+	// (2.3) compute delta w_newCu and sizeNewCu
 	deltaWNewCu := 0.0
+	sizeNewCu := 0
 	newCommunityOfU := communities[newCu]
-	for j := range newCommunityOfU {
+	for j, _ := range newCommunityOfU {
+		sizeNewCu += qm.cardinalities[j]
 		weightUJ, exists := weightsOfU[j]
 		if exists {
-			deltaWNewCu += float64(weightUJ)
+			deltaWNewCu += weightUJ * float64(cardU*qm.cardinalities[j])
 		}
 	}
 
-	// (2.4) compute size_oldCu and size_newCu
-	sizeOldCu := float64(len(oldCommunityOfU))
-	sizeNewCu := float64(len(newCommunityOfU))
-
-	// (2.5) compute the result
-	result := deltaWOldCu + deltaWNewCu - 2*qm.r*(sizeNewCu-sizeOldCu+1)
+	// (2.4) compute the result
+	result := deltaWOldCu + deltaWNewCu - 2.0*qm.r*float64(cardU*(sizeNewCu-sizeOldCu+cardU))
 
 	// -------------------------------------------------------------------------
 	// step 3: return the result
@@ -1147,21 +644,17 @@ func (qm CPM) DeltaQuality(communities []map[uint]bool,
 //		called dense. Only dense neighborhoods are connected to communities.
 // output:
 //	A map of core points to their neighborhood densities.
-func getCorePoints(simMat map[uint]map[uint]float64, eps float64,
-	minPts uint) map[uint]uint {
+func (cm ConcurrenceModel) getCorePoints(eps float64, minPts int) map[int]int {
 	// -------------------------------------------------------------------------
 	// step 1: compute the density of all points' neighborhoods
-	n := uint(len(simMat))
-	densities := make([]uint, n)
-	for pt := uint(0); pt < n; pt++ {
-		rowPt, exists := simMat[pt]
-		if !exists {
-			log.Fatal("Invalid similarity matrix")
-		}
-		density := uint(0)
-		for _, similarity := range rowPt {
+	n := cm.n
+	densities := make([]int, n)
+	for pt := 0; pt < n; pt++ {
+		rowPt := cm.concurrences[pt]
+		density := cm.cardinalities[pt]
+		for neighbor, similarity := range rowPt {
 			if similarity+eps >= 1.0 {
-				density++
+				density += cm.cardinalities[neighbor]
 			}
 		}
 		densities[pt] = density
@@ -1169,10 +662,10 @@ func getCorePoints(simMat map[uint]map[uint]float64, eps float64,
 
 	// -------------------------------------------------------------------------
 	// step 2: generate a list of points with dense neighborhoods
-	corePts := map[uint]uint{}
+	corePts := map[int]int{}
 	for pt, density := range densities {
 		if density >= minPts {
-			corePts[uint(pt)] = density
+			corePts[pt] = density
 		}
 	}
 
@@ -1187,8 +680,6 @@ func getCorePoints(simMat map[uint]map[uint]float64, eps float64,
 //	algorithm: generating a list of core members and another list of noncore
 //	neighbors for each core points.
 // input:
-//	simMat: the similarity matrix. It must be symmetric, all elements 0~1, and
-//		the diagonal elements are all 1.
 //	eps: the radius of neighborhood.
 //	minPts: Only if the neighborhood of a point contains at least minPt points
 //		(the center point of the neighborhood included), the neighborhood is
@@ -1197,23 +688,19 @@ func getCorePoints(simMat map[uint]map[uint]float64, eps float64,
 // output:
 //	output 1: a list of the core neighbors for each core point.
 //	output 2: a list of the noncore neighbors for each core point.
-func getNeighbors(simMat map[uint]map[uint]float64, eps float64,
-	minPts uint, corePts map[uint]uint) (map[uint]map[uint]bool,
-	map[uint]map[uint]bool) {
-	coreNeighbors := map[uint]map[uint]bool{}
-	noncoreNeighbors := map[uint]map[uint]bool{}
+func (cm ConcurrenceModel) getNeighbors(eps float64, minPts int, corePts map[int]int) (
+	coreNeighbors map[int]map[int]bool, noncoreNeighbors map[int]map[int]bool) {
+	coreNeighbors = map[int]map[int]bool{}
+	noncoreNeighbors = map[int]map[int]bool{}
 	for pt, _ := range corePts {
 		// create the rows of the results
-		coreRow := map[uint]bool{}
+		coreRow := map[int]bool{}
 		coreNeighbors[pt] = coreRow
-		noncoreRow := map[uint]bool{}
+		noncoreRow := map[int]bool{}
 		noncoreNeighbors[pt] = noncoreRow
 
 		// read the row of similarity matrix
-		simRow, rowExists := simMat[pt]
-		if !rowExists {
-			log.Fatal("invalid similarity matrix")
-		}
+		simRow := cm.concurrences[pt]
 
 		// scan through the row we just read
 		for neighbor, similarity := range simRow {
@@ -1232,7 +719,7 @@ func getNeighbors(simMat map[uint]map[uint]float64, eps float64,
 			}
 		}
 	}
-	return coreNeighbors, noncoreNeighbors
+	return
 }
 
 // =============================================================================
@@ -1248,51 +735,37 @@ func getNeighbors(simMat map[uint]map[uint]float64, eps float64,
 //		normalized jaccard similarity
 // output:
 //	A list of clusters.
-func (cm ConcurrenceModel) DBScan(eps float64, minPts uint, simType int) []map[uint]bool {
+func (cm ConcurrenceModel) DBScan(eps float64, minPts int) ([]map[int]bool, []int) {
 	// -------------------------------------------------------------------------
 	// step 1: initialize auxiliary data structures
-	communityIDs := map[uint]uint{}
-	communities := []map[uint]bool{}
-
-	// -------------------------------------------------------------------------
-	// step 2: build the similarity matrix
-	simMat := map[uint]map[uint]float64{}
-	switch simType {
-	case 0:
-		simMat = cm.InduceSimilarities()
-	case 1:
-		simMat = cm.InduceNormalizedSimilarities()
-	case 2:
-		simMat = cm.InduceJaccardSimilarities()
-	case 3:
-		simMat = cm.InduceWeightedJaccardSimilarities()
-	case 4:
-		simMat = cm.InduceNormalizedJaccardSimilarities()
+	communityIDs := make([]int, cm.n)
+	communities := []map[int]bool{}
+	for i := 0; i < cm.n; i++ {
+		communityIDs[i] = -1
 	}
 
 	// -------------------------------------------------------------------------
 	// step 3: find all core points and their neighborhood densities
-	corePts := getCorePoints(simMat, eps, minPts)
+	corePts := cm.getCorePoints(eps, minPts)
 
 	// -------------------------------------------------------------------------
 	// step 4: find neighbors for each core point
-	coreNeighbors, noncoreNeighbors := getNeighbors(simMat, eps, minPts, corePts)
+	coreNeighbors, noncoreNeighbors := cm.getNeighbors(eps, minPts, corePts)
 
 	// -------------------------------------------------------------------------
 	// step 5: loop until all core points are in communities
-	n := cm.GetN()
+	n := cm.n
 	for {
 		// (5.1) prepare an ID for the new community
-		c := uint(len(communities))
+		c := len(communities)
 
 		// (5.2) find the densist unassigned core point as the center point of
 		// the new cluster
 		centerPt := n
-		centerDensity := uint(0)
+		centerDensity := 0
 		for pt, density := range corePts {
 			// skip those points that have already been assigned into community
-			_, exists := communityIDs[pt]
-			if exists {
+			if communityIDs[pt] >= 0 {
 				continue
 			}
 
@@ -1309,21 +782,20 @@ func (cm ConcurrenceModel) DBScan(eps float64, minPts uint, simType int) []map[u
 		}
 
 		// (5.4) officially create the community
-		newCommunity := map[uint]bool{centerPt: true}
+		newCommunity := map[int]bool{centerPt: true}
 		communities = append(communities, newCommunity)
 		communityIDs[centerPt] = c
 
 		// (5.5) iteratively append neighbors to the new community
-		boundary := map[uint]bool{centerPt: true}
+		boundary := map[int]bool{centerPt: true}
 		for len(boundary) > 0 {
-			newBoundary := map[uint]bool{}
+			newBoundary := map[int]bool{}
 			for bpt, _ := range boundary {
 				bptNoncoreNeighbors, exists := noncoreNeighbors[bpt]
 				if exists {
 					for neighbor, _ := range bptNoncoreNeighbors {
 						// skip those already in a community
-						_, alreadyIn := communityIDs[neighbor]
-						if alreadyIn {
+						if communityIDs[neighbor] >= 0 {
 							continue
 						}
 						newCommunity[neighbor] = true
@@ -1336,8 +808,7 @@ func (cm ConcurrenceModel) DBScan(eps float64, minPts uint, simType int) []map[u
 				}
 				for neighbor, _ := range bptCoreNeighbors {
 					// skip those already in a community
-					_, alreadyIn := communityIDs[neighbor]
-					if alreadyIn {
+					if communityIDs[neighbor] >= 0 {
 						continue
 					}
 					newBoundary[neighbor] = true
@@ -1351,1094 +822,17 @@ func (cm ConcurrenceModel) DBScan(eps float64, minPts uint, simType int) []map[u
 
 	// -------------------------------------------------------------------------
 	// step 6: add isolated points into the result
-	for pt, _ := range simMat {
-		_, exists := communityIDs[pt]
-		if !exists {
-			newCommunity := map[uint]bool{pt: true}
+	for pt := 0; pt < cm.n; pt++ {
+		if communityIDs[pt] < 0 {
+			newCommunity := map[int]bool{pt: true}
+			communityIDs[pt] = len(communities)
 			communities = append(communities, newCommunity)
 		}
 	}
 
 	// -------------------------------------------------------------------------
 	// step 7: return the result
-	return communities
-}
-
-// =============================================================================
-// struct UintPair
-type UintPair struct {
-	i, j uint
-}
-
-// =============================================================================
-// func NewUintPair
-func MakeUintPair(i, j uint) UintPair {
-	if i < j {
-		return UintPair{i: i, j: j}
-	} else {
-		return UintPair{i: j, j: i}
-	}
-}
-
-// =============================================================================
-// func sim
-func sim(simMat map[uint]map[uint]float64, i, j uint) float64 {
-	row, exists := simMat[i]
-	if !exists {
-		return 0.0
-	}
-	simIJ, exists := row[j]
-	if !exists {
-		return 0.0
-	}
-	return simIJ
-}
-
-// =============================================================================
-// func (cm ConcurrenceModel) filterPairs
-// brief description: select pairs according to the thresholds.
-// input:
-//	nothing
-// output:
-//	nothing
-// note:
-//	The method of ConcurrenceModel is implemented due to the large memory
-//	consumption of getPairSimilarities. See the notes of getPairSimilarities
-//	for more detail.
-func (cm *ConcurrenceModel) filterPairs() {
-	pairs := map[UintPair]uint{}
-	for u := uint(0); u < cm.n; u++ {
-		row, exists := cm.concurrences[u]
-		if !exists {
-			continue
-		}
-		for v, _ := range row {
-			// skip same item
-			if u == v {
-				continue
-			}
-
-			// skip those already in pairs
-			pair := MakeUintPair(u, v)
-			_, exists := pairs[pair]
-			if exists {
-				continue
-			}
-
-			// skip those don't satisfy the balance threshold
-			freqU := cm.sumConcurrencesOf[u]
-			freqV := cm.sumConcurrencesOf[v]
-			if freqU < cm.balanceThreshold*freqV || freqV < cm.balanceThreshold*freqU {
-				continue
-			}
-
-			// skip those don't satisfy the concurrence threshold
-			if cm.GetConcurrence(u, v) < cm.concurrenceThreshold {
-				continue
-			}
-
-			// assign pair index
-			idxPair := uint(len(pairs))
-			pairs[pair] = idxPair
-		}
-	}
-	cm.pairs = pairs
-	cm.numPairs = uint(len(pairs))
-}
-
-// =============================================================================
-// struct PairSimMat
-// brief description: a pseudo matrix that could save a lot of memory from computing
-// 	the real pairwise similarity matrix.
-type PairSimMat struct {
-	pairs    map[UintPair]uint
-	numPairs uint
-	simMat   map[uint]map[uint]float64
-}
-
-// =============================================================================
-// struct PairSimVec
-type PairSimVec struct {
-	pair UintPair
-	data map[UintPair]float64
-}
-
-// =============================================================================
-// func (psm PairSimMat) GetRow
-// brief description: get a row of a pairwise similarity matrix.
-// input:
-//	pair1: the pair1 indexing the row
-//	idxPair1: the index of pair1
-// output:
-//	a channel that yields the rows.
-func (psm PairSimMat) GetRow(pair1 UintPair, idxPair1 uint) map[UintPair]float64 {
-	row := map[UintPair]float64{pair1: 1.0}
-	rowI1, exists := psm.simMat[pair1.i]
-	if !exists {
-		rowI1 = map[uint]float64{}
-	}
-	rowJ1, exists := psm.simMat[pair1.j]
-	if !exists {
-		rowJ1 = map[uint]float64{}
-	}
-	union1 := map[uint]bool{}
-	union2 := map[uint]bool{}
-	for col, _ := range rowI1 {
-		union1[col] = true
-		union2[col] = true
-	}
-	for col, _ := range rowJ1 {
-		union1[col] = true
-		union2[col] = true
-	}
-	for item1, _ := range union1 {
-		delete(union2, item1)
-		for item2, _ := range union2 {
-			pair2 := MakeUintPair(item1, item2)
-			idxPair2, exists := psm.pairs[pair2]
-			if !exists || idxPair1 == idxPair2 {
-				continue
-			}
-			// compute the similarity between these two pairs
-			simI1I2 := sim(psm.simMat, pair1.i, pair2.i)
-			simI1J2 := sim(psm.simMat, pair1.i, pair2.j)
-			simJ1I2 := sim(psm.simMat, pair1.j, pair2.i)
-			simJ1J2 := sim(psm.simMat, pair1.j, pair2.j)
-			simP1P2 := 0.25 * (simI1I2 + simI1J2 + simJ1I2 + simJ1J2)
-			if simP1P2 > 0.0 {
-				row[pair2] = simP1P2
-			}
-		}
-	}
-	return row
-}
-
-// =============================================================================
-// func (psm PairSimMat) GetRows
-// brief description: iterates through the rows of a pairwise similarity matrix.
-// input:
-//	nothing
-// output:
-//	a channel that yields the rows.
-func (psm PairSimMat) GetRows() chan PairSimVec {
-	// -------------------------------------------------------------------------
-	// step 1: create a channel for the results
-	results := make(chan PairSimVec)
-
-	// -------------------------------------------------------------------------
-	// step 2: call a groroutine that yields the results
-	go func() {
-		for pair1, idxPair1 := range psm.pairs {
-			results <- PairSimVec{pair: pair1, data: psm.GetRow(pair1, idxPair1)}
-		}
-		close(results)
-	}()
-
-	// -------------------------------------------------------------------------
-	// step 3: return the result channel
-	return results
-}
-
-// =============================================================================
-// func (cm ConcurrenceModel) getPairSimilarities
-// brief description: compute pair similarities from item similarities
-// input:
-//	simMat: the item similarities
-// output:
-//	the pair similaritites
-// note:
-//	The initial implementation of this function is too memory consuming. To reduce
-//	the memory consumption, we must keep the pairwise similarity matrix with smaller
-//	size and higher sparsity. To do so, the pairs must be selected by thresholds.
-//	The selection is relied on a method from the following reference:
-//
-//	Yang, S., Huang, G., & Cai, B. (2019). Discovering topic representative terms for
-//	short text clustering. IEEE Access, 7, 92037-92047.
-//
-//	Therefore, we must first convert this function to a method of ConcurrenceModel,
-//	so that we could use its sumConcurrencesOf and concurrences to filter the pairs.
-//	More specifically, we use cm.balanceThreshold to filter the pairs by nodewise
-//	frequency balance, and use cm.concurrenceThreshold to filter the pairs by
-//	edgewise frequency.
-func (cm ConcurrenceModel) getPairSimilarities(simMat map[uint]map[uint]float64,
-) PairSimMat {
-	// -------------------------------------------------------------------------
-	// step 1: find all pairs and index them
-	pairs := cm.pairs
-	log.Printf("number of pairs = %d\n", len(pairs))
-
-	// -------------------------------------------------------------------------
-	// step 2: create the pairwise similarities matrix
-	pairSimMat := PairSimMat{pairs: cm.pairs, numPairs: cm.numPairs, simMat: simMat}
-
-	// -------------------------------------------------------------------------
-	// step 2: return the pairwise similarities
-	return pairSimMat
-}
-
-// =============================================================================
-// func getCorePairs
-// brief description: This is part of an implementation to the pairwise DBScan
-//	algorithm: looking for all core points.
-// input:
-//	pairSimMat: the similarity matrix. It must be symmetric, all elements 0~1, and
-//		the diagonal elements are all 1.
-//	eps: the radius of neighborhood.
-//	minPts: Only if the neighborhood of a point contains at least minPt points
-//		(the center point of the neighborhood included), the neighborhood is
-//		called dense. Only dense neighborhoods are connected to communities.
-// output:
-//	A map of core pairs to their neighborhood densities.
-func getCorePairs(pairSimMat PairSimMat, eps float64, minPts uint) map[UintPair]uint {
-	// -------------------------------------------------------------------------
-	// step 1: compute the densities of neighborhoods for all pairs
-	densities := map[UintPair]uint{}
-	for pairSimVec := range pairSimMat.GetRows() {
-		pair := pairSimVec.pair
-		row := pairSimVec.data
-		myDensity := uint(0)
-		for _, sim := range row {
-			if sim+eps >= 1.0 {
-				myDensity++
-			}
-		}
-		densities[pair] = myDensity
-	}
-
-	// -------------------------------------------------------------------------
-	// step 2: generate a list of points with dense neighborhoods
-	corePairs := map[UintPair]uint{}
-	for pair, density := range densities {
-		if density >= minPts {
-			corePairs[pair] = density
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 3: return the result
-	return corePairs
-}
-
-// =============================================================================
-// func getPairNeighbors
-// brief description: This is part of an implementation to the pairwise DBScan
-//	algorithm: generating a list of core members and another list of noncore
-//	neighbors for each core points.
-// input:
-//	pair: the pair indexing a row of pairSimMat
-//	pairSimMat: the similarity matrix. It must be symmetric, all elements 0~1, and
-//		the diagonal elements are all 1.
-//	eps: the radius of neighborhood.
-//	minPts: Only if the neighborhood of a point contains at least minPt points
-//		(the center point of the neighborhood included), the neighborhood is
-//		called dense. Only dense neighborhoods are connected to communities.
-//	corePts: a map of core points to their neighborhood densities.
-// output:
-//	output 1: a list of the core neighbors for each core point.
-//	output 2: a list of the noncore neighbors for each core point.
-func getPairNeighbors(pair UintPair, pairSimMat PairSimMat, eps float64, minPts uint,
-	corePairs map[UintPair]uint) (map[UintPair]bool, map[UintPair]bool) {
-	coreNeighbors := map[UintPair]bool{}
-	noncoreNeighbors := map[UintPair]bool{}
-
-	// read the row of similarity matrix
-	idxPair, exists := pairSimMat.pairs[pair]
-	if !exists {
-		log.Fatal("invalid pair in getPairNeighbors")
-	}
-	simRow := pairSimMat.GetRow(pair, idxPair)
-
-	// scan through the row we just read
-	for neighbor, similarity := range simRow {
-		// skip pt itself
-		if neighbor == pair {
-			continue
-		}
-		// find pairs that locate within pt's neighborhood
-		if similarity+eps >= 1.0 {
-			_, isCorePair := corePairs[neighbor]
-			if isCorePair {
-				coreNeighbors[neighbor] = true
-			} else {
-				noncoreNeighbors[neighbor] = true
-			}
-		}
-	}
-	return coreNeighbors, noncoreNeighbors
-}
-
-// =============================================================================
-// func (cm ConcurrenceModel) PairDBScan
-// brief description: This is an implementation to the famous DBScan algorithm.
-// input:
-//	eps: the radius of neighborhood.
-//	minPts: Only if the neighborhood of a point contains at least minPt points
-//		(the center point of the neighborhood included), the neighborhood is
-//		called dense. Only dense neighborhoods are connected to communities.
-//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
-//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
-//		normalized jaccard similarity
-// output:
-//	A list of clusters.
-// note:
-//	The algorithm of this function is inspired by WPDM. The reference of WPDM could
-//	be found at the beginning of this source file.
-func (cm ConcurrenceModel) PairDBScan(eps float64, minPts uint, simType int) []map[UintPair]bool {
-	// -------------------------------------------------------------------------
-	// step 1: initialize auxiliary data structures
-	communityIDs := map[UintPair]uint{}
-	communities := []map[UintPair]bool{}
-
-	// -------------------------------------------------------------------------
-	// step 2: build the similarity matrix
-	simMat := map[uint]map[uint]float64{}
-	switch simType {
-	case 0:
-		simMat = cm.InduceSimilarities()
-	case 1:
-		simMat = cm.InduceNormalizedSimilarities()
-	case 2:
-		simMat = cm.InduceJaccardSimilarities()
-	case 3:
-		simMat = cm.InduceWeightedJaccardSimilarities()
-	case 4:
-		simMat = cm.InduceNormalizedJaccardSimilarities()
-	}
-	pairSimMat := cm.getPairSimilarities(simMat)
-
-	// -------------------------------------------------------------------------
-	// step 3: find all core pairs and their neighborhood densities
-	corePairs := getCorePairs(pairSimMat, eps, minPts)
-
-	// -------------------------------------------------------------------------
-	// step 4: find neighbors for each core point
-	//coreNeighbors, noncoreNeighbors := getPairNeighbors(pairSimMat, eps, minPts, corePairs)
-
-	// -------------------------------------------------------------------------
-	// step 4: loop until all core pairs are in communities
-	pairN := MakeUintPair(cm.n, cm.n)
-	for {
-		// (4.1) prepare an ID for the new community
-		c := uint(len(communities))
-
-		// (4.2) find the densist unassigned core point as the center point of
-		// the new cluster
-		centerPair := pairN
-		centerDensity := uint(0)
-		for pair, density := range corePairs {
-			// skip those pairs that have already been assigned into community
-			_, exists := communityIDs[pair]
-			if exists {
-				continue
-			}
-
-			// check whether with the currently most dense neighborhood
-			if density > centerDensity {
-				centerPair = pair
-				centerDensity = density
-			}
-		}
-
-		// (4.3) stop the loop if not new centerPt is found
-		if centerDensity == uint(0) {
-			break
-		}
-
-		// (4.4) officially create the community
-		newCommunity := map[UintPair]bool{centerPair: true}
-		communities = append(communities, newCommunity)
-		communityIDs[centerPair] = c
-
-		// (4.5) iteratively append neighbors to the new community
-		boundary := map[UintPair]bool{centerPair: true}
-		for len(boundary) > 0 {
-			newBoundary := map[UintPair]bool{}
-			for bpair, _ := range boundary {
-				bppCoreNeighbors, bppNoncoreNeighbors := getPairNeighbors(bpair, pairSimMat, eps,
-					minPts, corePairs)
-				for neighbor, _ := range bppNoncoreNeighbors {
-					// skip those already in a community
-					_, alreadyIn := communityIDs[neighbor]
-					if alreadyIn {
-						continue
-					}
-					newCommunity[neighbor] = true
-					communityIDs[neighbor] = c
-				}
-				for neighbor, _ := range bppCoreNeighbors {
-					// skip those already in a community
-					_, alreadyIn := communityIDs[neighbor]
-					if alreadyIn {
-						continue
-					}
-
-					newBoundary[neighbor] = true
-					newCommunity[neighbor] = true
-					communityIDs[neighbor] = c
-				}
-			}
-			boundary = newBoundary
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 6: add isolated pairs into the result
-	for pair, _ := range pairSimMat.pairs {
-		_, exists := communityIDs[pair]
-		if !exists {
-			newCommunity := map[UintPair]bool{pair: true}
-			communities = append(communities, newCommunity)
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 7: return the result
-	return communities
-}
-
-// =============================================================================
-// func mergeClusters
-// brief description: a utility function to merge the clusters in UHC algorithm.
-// input:
-//	distMat: the distance matrix
-//	communities: the clusters
-//	eps: the radius of neighborhood
-// output:
-//	the merged communities
-func mergeClusters(distMat []map[uint]float64, communities []map[uint]bool, eps float64,
-) []map[uint]bool {
-	// -------------------------------------------------------------------------
-	// step 1: find min distance
-	minDist := 1.0
-	iMinDist := uint(0)
-	jMinDist := uint(0)
-	for i, row := range distMat {
-		for j, dist := range row {
-			if dist < minDist {
-				minDist = dist
-				iMinDist = uint(i)
-				jMinDist = j
-			}
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 2: stop recursion if min distance is > eps
-	if minDist > eps {
-		return communities
-	}
-
-	// -------------------------------------------------------------------------
-	// step 3: merge two clusters
-	if iMinDist > jMinDist {
-		iMinDist, jMinDist = jMinDist, iMinDist
-	}
-	newCommunities := make([]map[uint]bool, len(communities)-1)
-	for k := uint(0); k < uint(len(newCommunities)); k++ {
-		if k < iMinDist {
-			newCommunities[k] = communities[k]
-		} else if k == iMinDist {
-			ci := communities[iMinDist]
-			cj := communities[jMinDist]
-			ck := map[uint]bool{}
-			for u, _ := range ci {
-				ck[u] = true
-			}
-			for u, _ := range cj {
-				ck[u] = true
-			}
-			newCommunities[k] = ck
-		} else if k < jMinDist {
-			newCommunities[k] = communities[k]
-		} else {
-			newCommunities[k] = communities[k+1]
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 4: merge the distance matrix accordingly
-	newDistMat := make([]map[uint]float64, len(newCommunities))
-	for k := uint(0); k < uint(len(newCommunities)); k++ {
-		newRow := map[uint]float64{}
-		newDistMat[k] = newRow
-
-		oldK := k
-		if k >= jMinDist {
-			oldK++
-		}
-		oldRow := distMat[oldK]
-		for l, dist := range oldRow {
-			if l < iMinDist {
-				newRow[l] = dist
-			} else if l == iMinDist {
-				distJ, exists := oldRow[jMinDist]
-				if exists {
-					newRow[l] = math.Min(dist, distJ)
-				} else {
-					newRow[l] = dist
-				}
-			} else if l < jMinDist {
-				newRow[l] = dist
-			} else if l > jMinDist {
-				newRow[l-1] = dist
-			}
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 5: return the recursive merge result
-	return mergeClusters(newDistMat, newCommunities, eps)
-}
-
-// =============================================================================
-// func (cm ConcurrenceModel) AHC
-// brief description: This is the implementation to agglomerative hierarchical clustering
-// input:
-//	eps: the radius of neighborhood.
-//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
-//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
-//		normalized jaccard similarity
-// output:
-//	A list of clusters.
-func (cm ConcurrenceModel) AHC(eps float64, simType int) []map[uint]bool {
-	// -------------------------------------------------------------------------
-	// step 1: initialize auxiliary data structures
-	communityIDs := make([]uint, cm.n)
-	communities := []map[uint]bool{}
-	for u, _ := range cm.concurrences {
-		communityIDs[u] = uint(len(communities))
-		communities = append(communities, map[uint]bool{u: true})
-	}
-
-	// -------------------------------------------------------------------------
-	// step 2: build the similarity matrix
-	simMat := map[uint]map[uint]float64{}
-	switch simType {
-	case 0:
-		simMat = cm.InduceSimilarities()
-	case 1:
-		simMat = cm.InduceNormalizedSimilarities()
-	case 2:
-		simMat = cm.InduceJaccardSimilarities()
-	case 3:
-		simMat = cm.InduceWeightedJaccardSimilarities()
-	case 4:
-		simMat = cm.InduceNormalizedJaccardSimilarities()
-	}
-
-	// -------------------------------------------------------------------------
-	// step 3: build clusterwise distance matrix
-	distMat := make([]map[uint]float64, len(communities))
-	for u, weightsOfU := range cm.concurrences {
-		row := map[uint]float64{}
-		iu := communityIDs[u]
-		distMat[iu] = row
-		for v, _ := range weightsOfU {
-			if u == v {
-				continue
-			}
-			iv := communityIDs[v]
-			row[iv] = 1.0 - simMat[u][v]
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 3: recursively merge clusters
-	return mergeClusters(distMat, communities, eps)
-
-}
-
-// =============================================================================
-// func (cm ConcurrenceModel) PairAHC
-// brief description: This is the implementation to agglomerative hierarchical clustering
-// input:
-//	eps: the radius of neighborhood.
-//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
-//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
-//		normalized jaccard similarity
-// output:
-//	A list of clusters.
-// note:
-//	The algorithm of this function is inspired by WPDM. The reference of WPDM could
-//	be found at the beginning of this source file.
-func (cm ConcurrenceModel) PairAHC(eps float64, simType int) []map[UintPair]bool {
-	// -------------------------------------------------------------------------
-	// step 1: create auxiliary data structures
-	communityIDs := map[UintPair]uint{}
-	idToPair := map[uint]UintPair{}
-	communities := []map[UintPair]bool{}
-
-	// -------------------------------------------------------------------------
-	// step 2: build the similarity matrix
-	simMat := map[uint]map[uint]float64{}
-	switch simType {
-	case 0:
-		simMat = cm.InduceSimilarities()
-	case 1:
-		simMat = cm.InduceNormalizedSimilarities()
-	case 2:
-		simMat = cm.InduceJaccardSimilarities()
-	case 3:
-		simMat = cm.InduceWeightedJaccardSimilarities()
-	case 4:
-		simMat = cm.InduceNormalizedJaccardSimilarities()
-	}
-	pairSimMat := cm.getPairSimilarities(simMat)
-
-	// -------------------------------------------------------------------------
-	// step 3: initialize auxiliary data structures
-	flattenSimMat := map[uint]map[uint]float64{}
-	flattenCommunities := []map[uint]bool{}
-	for pair, _ := range pairSimMat.pairs {
-		idxPair := uint(len(communityIDs))
-		communityIDs[pair] = idxPair
-		idToPair[idxPair] = pair
-		flattenCommunities = append(flattenCommunities, map[uint]bool{idxPair: true})
-		flattenSimMat[idxPair] = map[uint]float64{}
-	}
-	for pairSimVec := range pairSimMat.GetRows() {
-		pair := pairSimVec.pair
-		pairRow := pairSimVec.data
-		idxPair, _ := communityIDs[pair]
-		flattenRow, _ := flattenSimMat[idxPair]
-		for neighbor, sim := range pairRow {
-			idxNeighbor, _ := communityIDs[neighbor]
-			flattenRow[idxNeighbor] = sim
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 3: build clusterwise distance matrix
-	distMat := make([]map[uint]float64, len(flattenSimMat))
-	for u, rowOfU := range flattenSimMat {
-		row := map[uint]float64{}
-		distMat[u] = row
-		for v, sim := range rowOfU {
-			if u == v {
-				continue
-			}
-			row[v] = 1.0 - sim
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 3: recursively merge clusters
-	flattenCommunities = mergeClusters(distMat, flattenCommunities, eps)
-
-	// -------------------------------------------------------------------------
-	// step 4: convert flatten communities to communities
-	for _, flattenC := range flattenCommunities {
-		c := map[UintPair]bool{}
-		for idxPair, _ := range flattenC {
-			pair := idToPair[idxPair]
-			c[pair] = true
-		}
-		communities = append(communities, c)
-	}
-
-	// -------------------------------------------------------------------------
-	// step 5: return the result
-	return communities
-}
-
-// =============================================================================
-// func getGroupPairSimilarities
-// brief description: get group similarities from pair similarities
-// input:
-//	groups: a list of groups of items
-//	pairSimMat: the pairwise similarity mat
-//	eps: the radius of neighborhood for making the result more sparse
-// output:
-//	the group similarities
-func getGroupPairSimilarities(groups []map[uint]bool, pairSimMat PairSimMat,
-	eps float64) map[uint]map[uint]float64 {
-	// -------------------------------------------------------------------------
-	// step 1: convert groups to pair representation
-	numGroups := uint(len(groups))
-	pairsOfGroups := make([]map[UintPair]uint, numGroups)
-	for idxGroup, group := range groups {
-		pairs := map[UintPair]uint{}
-		for i, _ := range group {
-			for j, _ := range group {
-				if i < j {
-					pair := MakeUintPair(i, j)
-					idxPair, exists := pairSimMat.pairs[pair]
-					if exists {
-						pairs[pair] = idxPair
-					}
-				}
-			}
-		}
-		pairsOfGroups[idxGroup] = pairs
-	}
-
-	// ------------------------------------------------------------------------
-	// step 2: find 5% most frequent pairs
-	pairGroupCount := map[UintPair]uint{}
-	for _, pairs := range pairsOfGroups {
-		for pair, _ := range pairs {
-			count, exists := pairGroupCount[pair]
-			if !exists {
-				count = uint(0)
-			}
-			pairGroupCount[pair] = count + uint(1)
-		}
-	}
-	numSortedPairs := len(pairGroupCount)
-	sortedPairs := make([]UintPair, numSortedPairs)
-	idx := 0
-	for pair, _ := range pairGroupCount {
-		sortedPairs[idx] = pair
-		idx++
-	}
-	sort.Slice(sortedPairs, func(i, j int) bool {
-		valueI, _ := pairGroupCount[sortedPairs[i]]
-		valueJ, _ := pairGroupCount[sortedPairs[j]]
-		return valueI > valueJ
-	})
-	numMostFrequent := numSortedPairs / 20
-	mostFrequent := sortedPairs[0:numMostFrequent]
-
-	// ------------------------------------------------------------------------
-	// step 3: get similarities for the most frequent pairs
-	simRowsOfMostFrequent := map[UintPair]map[UintPair]float64{}
-	numCPUs := runtime.NumCPU()
-	chIdxs := make(chan int)
-	chPairSimVec := make(chan PairSimVec)
-	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
-		go func(idxCPU int) {
-			mySimRows := map[UintPair]map[UintPair]float64{}
-			for idx := range chIdxs {
-				pair := mostFrequent[idx]
-				idxPair := pairSimMat.pairs[pair]
-				simRow := pairSimMat.GetRow(pair, idxPair)
-				mySimRows[pair] = simRow
-				if len(mySimRows) > 0 && len(mySimRows)%10 == 0 {
-					fmt.Printf("%d: %d of %d sim rows have been computed\n", idxCPU,
-						len(mySimRows), numMostFrequent)
-				}
-			}
-			for pair, simRow := range mySimRows {
-				chPairSimVec <- PairSimVec{pair: pair, data: simRow}
-			}
-		}(idxCPU)
-	}
-	for i := 0; i < numMostFrequent; i++ {
-		chIdxs <- i
-	}
-	close(chIdxs)
-	for i := 0; i < numMostFrequent; i++ {
-		fmt.Printf("most freq: %d of %d\n", i, numMostFrequent)
-		pairSimVec := <-chPairSimVec
-		simRowsOfMostFrequent[pairSimVec.pair] = pairSimVec.data
-	}
-	runtime.GC()
-
-	// ------------------------------------------------------------------------
-	// step 4: compute the result
-	result := map[uint]map[uint]float64{}
-	for i := uint(0); i < numGroups; i++ {
-		rowOfResult := map[uint]float64{i: 1.0}
-		result[i] = rowOfResult
-	}
-	chIdxs = make(chan int)
-	chWorkers := make(chan bool)
-	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
-		go func() {
-			for idx := range chIdxs {
-				pairs := pairsOfGroups[idx]
-				if len(pairs) == 0 {
-					continue
-				}
-				simRows := map[UintPair]map[UintPair]float64{}
-				for pair, idxPair := range pairs {
-					simRow, exists := simRowsOfMostFrequent[pair]
-					if !exists {
-						simRow = pairSimMat.GetRow(pair, idxPair)
-					}
-					simRows[pair] = simRow
-				}
-				fmt.Printf("%d of %d\n", idx, numGroups)
-				for j := uint(0); j < numGroups; j++ {
-					pairsOfJ := pairsOfGroups[j]
-					if len(pairsOfJ) == 0 {
-						continue
-					}
-					simIJ := 0.0
-					for pairI, _ := range pairs {
-						simRowOfI, _ := simRows[pairI]
-						for pairJ, _ := range pairsOfJ {
-							sim, exists := simRowOfI[pairJ]
-							if !exists {
-								continue
-							}
-							simIJ += sim
-						}
-					}
-					simIJ /= float64(len(pairs) * len(pairsOfJ))
-					result[uint(idx)][j] = simIJ
-				}
-			}
-			chWorkers <- true
-		}()
-	}
-	for i := 0; i < int(numGroups); i++ {
-		chIdxs <- i
-	}
-	close(chIdxs)
-	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
-		<-chWorkers
-	}
-
-	// ------------------------------------------------------------------------
-	// step 3: return the result
-	return result
-}
-
-// =============================================================================
-// func (cm ConcurrenceModel) GetGroupSimMat
-func (cm ConcurrenceModel) GetGroupSimMat(groups []map[uint]bool, eps float64,
-	simType int, fileName string) map[uint]map[uint]float64 {
-	file, err := os.Open(fileName)
-	if err != nil {
-		simMat := map[uint]map[uint]float64{}
-		switch simType {
-		case 0:
-			simMat = cm.InduceSimilarities()
-		case 1:
-			simMat = cm.InduceNormalizedSimilarities()
-		case 2:
-			simMat = cm.InduceJaccardSimilarities()
-		case 3:
-			simMat = cm.InduceWeightedJaccardSimilarities()
-		case 4:
-			simMat = cm.InduceNormalizedJaccardSimilarities()
-		}
-		pairSimMat := cm.getPairSimilarities(simMat)
-		groupSimMat := getGroupPairSimilarities(groups, pairSimMat, eps)
-		file, err = os.Create(fileName)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		for i, row := range groupSimMat {
-			file.WriteString(fmt.Sprintf("%d,%d\n", i, len(row)))
-			for j, value := range row {
-				file.WriteString(fmt.Sprintf("%d,%v\n", j, value))
-			}
-		}
-		file.Close()
-		return groupSimMat
-	} else {
-		defer file.Close()
-		groupSimMat := map[uint]map[uint]float64{}
-		scanner := bufio.NewScanner(file)
-		for {
-			if !scanner.Scan() {
-				break
-			}
-			var i uint
-			var lenRow int
-			_, err := fmt.Sscanf(scanner.Text(), "%d,%d", &i, &lenRow)
-			if err != nil {
-				log.Fatalln(fmt.Sprintf("file %s is of wrong format", fileName))
-			}
-			row := map[uint]float64{}
-			groupSimMat[i] = row
-			for k := 0; k < lenRow; k++ {
-				if !scanner.Scan() {
-					log.Fatalln(fmt.Sprintf("file %s is of wrong format", fileName))
-				}
-				var j uint
-				var value float64
-				_, err := fmt.Sscanf(scanner.Text(), "%d,%v", &j, &value)
-				if err != nil {
-					log.Fatalln(fmt.Sprintf("file %s is of wrong format", fileName))
-				}
-				row[j] = value
-			}
-			if len(groupSimMat)%100 == 0 {
-				fmt.Printf("%d rows of groupSimMat loaded\n", len(groupSimMat))
-			}
-		}
-		return groupSimMat
-	}
-}
-
-// =============================================================================
-// func (cm ConcurrenceModel) GroupPairDBScan
-// brief description: This is an implementation to the famous DBScan algorithm.
-// input:
-//	groups: a list of groups
-//	eps: the radius of neighborhood.
-//	minPts: Only if the neighborhood of a point contains at least minPt points
-//		(the center point of the neighborhood included), the neighborhood is
-//		called dense. Only dense neighborhoods are connected to communities.
-//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
-//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
-//		normalized jaccard similarity
-//	workSpaceFileName: a file name for intermediate result
-// output:
-//	A list of clusters.
-// note:
-// note:
-//	The algorithm of this function is inspired by WPDM. The reference of WPDM could
-//	be found at the beginning of this source file.
-func (cm ConcurrenceModel) GroupPairDBScan(groups []map[uint]bool, eps float64, minPts uint,
-	simType int, workSpaceFileName string) []map[uint]bool {
-	// -------------------------------------------------------------------------
-	// step 1: initialize auxiliary data structures
-	communityIDs := map[uint]uint{}
-	communities := []map[uint]bool{}
-
-	// -------------------------------------------------------------------------
-	// step 2: build the similarity matrix
-	groupSimMat := cm.GetGroupSimMat(groups, eps, simType, workSpaceFileName)
-
-	// -------------------------------------------------------------------------
-	// step 3: find all core points and their neighborhood densities
-	coreGroups := getCorePoints(groupSimMat, eps, minPts)
-
-	// -------------------------------------------------------------------------
-	// step 4: find neighbors for each core group
-	coreNeighbors, noncoreNeighbors := getNeighbors(groupSimMat, eps, minPts, coreGroups)
-
-	// -------------------------------------------------------------------------
-	// step 5: loop until all core groups are in communities
-	n := uint(len(groups))
-	for {
-		// (5.1) prepare an ID for the new community
-		c := uint(len(communities))
-
-		// (5.2) find the densist unassigned core group as the center group of
-		// the new cluster
-		centerGroup := n
-		centerDensity := uint(0)
-		for groupID, density := range coreGroups {
-			// skip those groups that have already been assigned into community
-			_, exists := communityIDs[groupID]
-			if exists {
-				continue
-			}
-
-			// check whether with the currently most dense neighborhood
-			if density > centerDensity {
-				centerGroup = groupID
-				centerDensity = density
-			}
-		}
-
-		// (5.3) stop the loop if not new centerPt is found
-		if centerGroup == n {
-			break
-		}
-
-		// (5.4) officially create the community
-		newCommunity := map[uint]bool{centerGroup: true}
-		communities = append(communities, newCommunity)
-		communityIDs[centerGroup] = c
-
-		// (5.5) iteratively append neighbors to the new community
-		boundary := map[uint]bool{centerGroup: true}
-		for len(boundary) > 0 {
-			newBoundary := map[uint]bool{}
-			for bpg, _ := range boundary {
-				bpgNoncoreNeighbors, exists := noncoreNeighbors[bpg]
-				if exists {
-					for neighbor, _ := range bpgNoncoreNeighbors {
-						// skip those already in a community
-						_, alreadyIn := communityIDs[neighbor]
-						if alreadyIn {
-							continue
-						}
-						newCommunity[neighbor] = true
-						communityIDs[neighbor] = c
-					}
-				}
-				bpgCoreNeighbors, exists := coreNeighbors[bpg]
-				if !exists {
-					continue
-				}
-				for neighbor, _ := range bpgCoreNeighbors {
-					// skip those already in a community
-					_, alreadyIn := communityIDs[neighbor]
-					if alreadyIn {
-						continue
-					}
-					newBoundary[neighbor] = true
-					newCommunity[neighbor] = true
-					communityIDs[neighbor] = c
-				}
-			}
-			boundary = newBoundary
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 6: add isolated points into the result
-	for groupID, _ := range groupSimMat {
-		_, exists := communityIDs[groupID]
-		if !exists {
-			newCommunity := map[uint]bool{groupID: true}
-			communities = append(communities, newCommunity)
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 7: return the result
-	return communities
-}
-
-// =============================================================================
-// func (cm ConcurrenceModel) GroupPairAHC
-// brief description: This is the implementation to agglomerative hierarchical clustering
-// input:
-//	groups: a list of groups
-//	eps: the radius of neighborhood.
-//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
-//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
-//		normalized jaccard similarity
-//	workSpaceFileName: a file name for intermediate result
-// output:
-//	A list of clusters.
-// note:
-//	The algorithm of this function is inspired by WPDM. The reference of WPDM could
-//	be found at the beginning of this source file.
-func (cm ConcurrenceModel) GroupPairAHC(groups []map[uint]bool, eps float64, simType int,
-	workSpaceFileName string) []map[uint]bool {
-	// -------------------------------------------------------------------------
-	// step 1: initialize auxiliary data structures
-	n := uint(len(groups))
-	communityIDs := make([]uint, cm.n)
-	communities := []map[uint]bool{}
-	for u := uint(0); u < n; u++ {
-		communityIDs[u] = u
-		communities = append(communities, map[uint]bool{u: true})
-	}
-
-	// -------------------------------------------------------------------------
-	// step 2: build the similarity matrix
-	groupSimMat := cm.GetGroupSimMat(groups, eps, simType, workSpaceFileName)
-
-	// -------------------------------------------------------------------------
-	// step 3: build clusterwise distance matrix
-	distMat := make([]map[uint]float64, len(communities))
-	for u, rowsOfU := range groupSimMat {
-		row := map[uint]float64{}
-		iu := communityIDs[u]
-		distMat[iu] = row
-		for v, sim := range rowsOfU {
-			if u == v {
-				continue
-			}
-			iv := communityIDs[v]
-			row[iv] = 1.0 - sim
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 3: recursively merge clusters
-	return mergeClusters(distMat, communities, eps)
-
+	return communities, communityIDs
 }
 
 // =============================================================================
@@ -2450,11 +844,11 @@ func (cm ConcurrenceModel) GroupPairAHC(groups []map[uint]bool, eps float64, sim
 //	communities: the original concurrence graph's communities
 // output:
 //	the flatten communities
-func flattenCommunities(aggCommunities, communities []map[uint]bool,
-) []map[uint]bool {
-	result := []map[uint]bool{}
+func flattenCommunities(aggCommunities, communities []map[int]bool,
+) []map[int]bool {
+	result := []map[int]bool{}
 	for _, aggC := range aggCommunities {
-		newC := map[uint]bool{}
+		newC := map[int]bool{}
 		for idxC, _ := range aggC {
 			c := communities[idxC]
 			for pt, _ := range c {
@@ -2480,482 +874,560 @@ func flattenCommunities(aggCommunities, communities []map[uint]bool,
 //	If the input communities is empty, this function will act as the classical
 //	Louvain algorithm that uses single point communities as the initial
 //	communities.
-func Louvain(qm QualityModel, communities []map[uint]bool, opts ...string,
-) []map[uint]bool {
-	// step 1: parsing options
-	useSeqSelector := true
-	multiResolution := true
-	shuffle := false
-	for _, opt := range opts {
-		switch opt {
-		case "priority selector":
-			useSeqSelector = false
-		case "sequential selector":
-			useSeqSelector = true
-		case "single resolution":
-			multiResolution = false
-		case "multiple resolution":
-			multiResolution = true
-		case "shuffle":
-			shuffle = true
-		case "no shuffle":
-			shuffle = false
-		}
-	}
-
+func Louvain(qm QualityModel, communities []map[int]bool, communityIDs []int, maxIters int,
+) ([]map[int]bool, []int) {
 	// -------------------------------------------------------------------------
-	// step 2: complete communities with isolated points added as single point
-	// communities.
-	result := qm.GetCompleteCommunities(communities)
+	// step 1: initialize communities and communityIDs if they are nil
 	n := qm.GetN()
-
-	// -------------------------------------------------------------------------
-	// step 3: get the community ID for each point
-	communityIDs := make([]uint, n)
-	for communityID, community := range result {
-		for point, _ := range community {
-			communityIDs[point] = uint(communityID)
+	if communities == nil || communityIDs == nil {
+		communities = make([]map[int]bool, n)
+		communityIDs = make([]int, n)
+		for i := 0; i < n; i++ {
+			communities[i] = map[int]bool{i: true}
+			communityIDs[i] = i
 		}
 	}
 
 	// -------------------------------------------------------------------------
-	// step 4: iteratively scan through the points to find out what is the best
+	// step 2: iteratively scan through the points to find out what is the best
 	// community for a point. If all points are in their best communities, stop
 	// the iteration.
-	m := uint(len(result))
-	for {
-		// (4.1) create the access order of points
-		points := make([]uint, n)
-		for i := 0; i < int(n); i++ {
-			points[i] = uint(i)
-		}
+	numCPUs := runtime.NumCPU()
+	var wg sync.WaitGroup
+	type MergeRequest struct {
+		dst  int
+		gain float64
+	}
+	type MergeDecision struct {
+		src  int
+		gain float64
+	}
+	mergeRequests := make([]MergeRequest, n)
+	mergeOrders := make([]int, n)
+	numIters := 0
+	for iter := 0; iter < maxIters; iter++ {
+		// (2.1) compute merge requests
+		m := len(communities)
+		wg.Add(numCPUs)
+		for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+			go func(idxCPU int) {
+				u0 := n * idxCPU / numCPUs
+				u1 := n * (idxCPU + 1) / numCPUs
+				gains := make([]float64, m)
+				for u := u0; u < u1; u++ {
+					mergeRequests[u] = MergeRequest{dst: -1, gain: 0.0}
+					mergeOrders[u] = u
+					oldCu := communityIDs[u]
+					neighbors := qm.GetNeighbors(u)
+					sumGains := 0.0
+					if len(neighbors) < m {
+						visitedCommunities := map[int]float64{}
+						for neighbor, _ := range neighbors {
+							newCu := communityIDs[neighbor]
+							if newCu == oldCu {
+								continue
+							}
+							_, visited := visitedCommunities[newCu]
+							if visited {
+								continue
+							}
 
-		// (4.2) optionally, shuffle the access order of points
-		if shuffle {
-			rand.Shuffle(int(n), func(i, j int) {
-				points[i], points[j] = points[j], points[i]
-			})
-		}
+							deltaQ := qm.DeltaQuality(communities, u, oldCu, newCu)
+							if deltaQ > 0.0 {
+								visitedCommunities[newCu] = deltaQ
+								sumGains += deltaQ
+							} else {
+								visitedCommunities[newCu] = 0.0
+							}
+						}
 
-		// (4.3) move points
-		if useSeqSelector {
-			done := true
-			for _, u := range points {
-				oldCu := communityIDs[u]
-				bestDeltaQuality := 0.0
-				bestNewCu := oldCu
-				for newCu := uint(0); newCu < m; newCu++ {
-					deltaQuality := qm.DeltaQuality(result, u, oldCu, newCu)
-					if deltaQuality > bestDeltaQuality {
-						bestDeltaQuality = deltaQuality
-						bestNewCu = newCu
+						if sumGains > 0.0 {
+							x := rand.Float64() * sumGains
+							sum := 0.0
+							for c, gain := range visitedCommunities {
+								sum += gain
+								if sum >= x {
+									//fmt.Printf("u = %d, c = %d, sum = %v, x = %v\n", u, c, sum, x)
+
+									mergeRequests[u].dst = c
+									mergeRequests[u].gain = gain
+									break
+								}
+							}
+						}
+					} else {
+						for newCu := 0; newCu < m; newCu++ {
+							if newCu == oldCu {
+								gains[newCu] = 0.0
+								continue
+							}
+							deltaQ := qm.DeltaQuality(communities, u, oldCu, newCu)
+							if deltaQ > 0.0 {
+								gains[newCu] = deltaQ
+								sumGains += deltaQ
+							} else {
+								gains[newCu] = 0.0
+							}
+
+							// if deltaQ > mergeRequests[u].gain {
+							// 	mergeRequests[u].dst = newCu
+							// 	mergeRequests[u].gain = deltaQ
+							// }
+						}
+
+						if sumGains > 0.0 {
+							x := rand.Float64() * sumGains
+							sum := 0.0
+							for c := 0; c < m; c++ {
+								sum += gains[c]
+								//fmt.Printf("u = %d, sum = %v, x = %v\n", u, sum, x)
+								if sum >= x {
+									mergeRequests[u].dst = c
+									mergeRequests[u].gain = gains[c]
+									break
+								}
+							}
+						}
 					}
 				}
-
-				if bestDeltaQuality > 0.0 {
-					delete(result[oldCu], u)
-					result[bestNewCu][u] = true
-					communityIDs[u] = bestNewCu
-					done = false
-				}
-			}
-			if done {
-				break
-			}
-		} else {
-			bestDeltaQuality := 0.0
-			bestU := uint(0)
-			oldCBestU := communityIDs[0]
-			bestNewCu := oldCBestU
-			for _, u := range points {
-				oldCu := communityIDs[u]
-				for newCu := uint(0); newCu < m; newCu++ {
-					deltaQuality := qm.DeltaQuality(result, u, oldCu, newCu)
-					if deltaQuality > bestDeltaQuality {
-						bestDeltaQuality = deltaQuality
-						bestU = u
-						oldCBestU = oldCu
-						bestNewCu = newCu
-					}
-				}
-			}
-			if bestDeltaQuality == 0.0 {
-				break
-			}
-			delete(result[oldCBestU], bestU)
-			result[bestNewCu][bestU] = true
-			communityIDs[bestU] = bestNewCu
+				wg.Done()
+			}(idxCPU)
 		}
-	}
+		wg.Wait()
 
-	// -------------------------------------------------------------------------
-	// step 5: remove empty communities
-	oldResult := result
-	result = []map[uint]bool{}
-	for _, c := range oldResult {
-		if len(c) > 0 {
-			result = append(result, c)
-		}
-	}
+		// (2.2) sort merge requests
+		sort.Slice(mergeOrders, func(i, j int) bool {
+			return mergeRequests[mergeOrders[i]].gain > mergeRequests[mergeOrders[j]].gain
+		})
 
-	// -------------------------------------------------------------------------
-	// step 6: if required, do the multi-resolution part
-	if multiResolution {
-		// ---------------------------------------------------------------------
-		// (6.1) create aggregate network from the result
-		newQM := qm.Aggregate(result)
-
-		// ---------------------------------------------------------------------
-		// (6.2) compute aggregated result from the aggregate network
-		aggResult := Louvain(newQM, []map[uint]bool{}, opts...)
-
-		// ---------------------------------------------------------------------
-		// (6.3) check whether the new result has merged something. If it has,
-		// then revise the result accordingly
-		if uint(len(aggResult)) < newQM.GetN() {
-			result = flattenCommunities(aggResult, result)
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 7: return the result
-	return result
-}
-
-// =============================================================================
-// func refineForLeiden
-// brief description: refine communities for Leiden algorithm
-// input:
-//	qm: a quality model.
-//	communities: a list of clusters
-//	gamma: the threshold for qm.connectsWell
-//	theta: a threshold for sampling probablities
-// output:
-//	refinedCommunities, refinement
-//	refinedCommunities: the result communities refined from input communities.
-//	refinement: for each input community, list which refined communities it
-//		contains.
-func refineForLeiden(qm QualityModel, communities []map[uint]bool,
-	gamma, theta float64) ([]map[uint]bool, []map[uint]bool) {
-	if gamma <= 0.0 || theta <= 0.0 {
-		log.Fatal("gamma and theta must be > 0.")
-	}
-
-	// -------------------------------------------------------------------------
-	// step 1: initialize result with singleton communities
-	n := qm.GetN()
-	refinedCommunties := make([]map[uint]bool, n)
-	for i := uint(0); i < n; i++ {
-		refinedCommunties[i] = map[uint]bool{i: true}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 2: find out for each point which input community it is in.
-	inputCommunityID := make([]int, n)
-	for idxC, c := range communities {
-		for u, _ := range c {
-			inputCommunityID[u] = idxC
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 3: iteratively merge communities in result based on five rules:
-	//	1. 	A community in result can only be merged with a sub-community in
-	//		one of the input communties.
-	//	2.	A communtiy in result is merged only if the merge increases the
-	//		quality of the result.
-	//	3.	Two communities are merged only if both of them are well connected
-	//		to input communities with threshold gamma and at least one of them
-	//		is singleton.
-	//	4.	Tow communities are merged only if they are connected.
-	//	5.	When a community can be merged with multiple communities, we select
-	//		which to be merged with randomly with sampling probablities set as
-	//		proportional to 1/theta * qualityGain
-	for {
-		done := true
-		for i, refinedCi := range refinedCommunties {
-			// ----------------------------------------------------------------
-			// (3.1) skip non-singleton communities in result
-			if len(refinedCi) > 1 {
-				continue
-			}
-
-			// ----------------------------------------------------------------
-			// (3.2) skip those refinedCi not connected well with any of the
-			// input communities
-			inputC := communities[inputCommunityID[i]]
-			if !qm.ConnectsWell(refinedCi, inputC, gamma) {
-				continue
-			}
-
-			// ----------------------------------------------------------------
-			// (3.3) find those result communities in the same input community
-			// as refinedC that has at least one node connected to refinedCi.
-			// This enforces rule 1 and 4.
-			connected := []uint{}
-			u := uint(i)
-			for j, _ := range inputC {
-				refinedCj := refinedCommunties[j]
-				// skip empty result communities
-				if len(refinedCj) == 0 {
-					continue
-				}
-
-				// Check whether there is at least one node connected to
-				// refinedCi. If there is, append j to connected
-				for v, _ := range refinedCj {
-					if qm.Connects(u, v) {
-						connected = append(connected, j)
-						break
-					}
-				}
-			}
-
-			// ----------------------------------------------------------------
-			// (3.4) scan throughs connected to search for those resultCi can
-			// be merged with.
-			logProb := map[uint]float64{}
-			sumLogProb := 0.0
-			for _, j := range connected {
-				refinedCj := refinedCommunties[j]
-
-				// Skip this refinedCj if it is not connected well to inputC.
-				// This completes the enforcement of rule 3 with (3.1) & (3.2).
-				if !qm.ConnectsWell(refinedCj, inputC, gamma) {
-					continue
-				}
-
-				// Compute the quality gain when merging resultCi and resultCj
-				deltaQuality := qm.DeltaQuality(refinedCommunties, u, u, j)
-
-				// Skip this if the quality gain is not positive
-				if deltaQuality <= 0.0 {
-					continue
-				}
-
-				// record a sampling probability
-				myLogProb := deltaQuality / theta
-				logProb[j] = myLogProb
-				sumLogProb += myLogProb
-			}
-
-			// ----------------------------------------------------------------
-			// (3.5) if none resultCi be merged with, skip this resultCi
-			if len(logProb) == 0 {
-				continue
-			}
-
-			// ----------------------------------------------------------------
-			// (3.6) normalize the sampling probabilities
-			for j, value := range logProb {
-				logProb[j] = value - sumLogProb
-			}
-
-			// ----------------------------------------------------------------
-			// (3.7) sample a resultCj using logProb
-			// first, get a random number x within [0.0, 1.0)
-			x := rand.Float64()
-			// then, scan through logProb to find the sample
-			y := 0.0
-			sample := uint(0)
-			for j, value := range logProb {
-				prob := math.Exp(value)
-				y += prob
-				if y >= x {
-					sample = j
-					break
-				}
-			}
-
-			// ----------------------------------------------------------------
-			// (3.8) now merge resultCi and sample
-			refinedCommunties[i] = map[uint]bool{}
-			refinedCommunties[sample][u] = true
-			done = false
-		}
-
-		// ---------------------------------------------------------------------
-		// end the loop if no merge happens
-		if done {
+		// (2.3) exit the loop if no merge is required
+		bestMerge := mergeRequests[mergeOrders[0]]
+		if bestMerge.dst < 0 || bestMerge.gain <= 0.0 {
 			break
 		}
-	}
 
-	// -------------------------------------------------------------------------
-	// step 4: remove empty communties in result and record non-empty ones in
-	// the refinement mapping
-	oldRefinedCommunities := refinedCommunties
-	refinedCommunties = []map[uint]bool{}
-	refinement := make([]map[uint]bool, len(communities))
-	for i := 0; i < len(communities); i++ {
-		refinement[i] = map[uint]bool{}
-	}
-	for i, c := range oldRefinedCommunities {
-		if len(c) > 0 {
-			newI := uint(len(refinedCommunties))
-			refinement[inputCommunityID[i]][newI] = true
-			refinedCommunties = append(refinedCommunties, c)
+		// (2.4) compute merge decisions
+		mergeDecisions := make([]MergeDecision, m)
+		for i := 0; i < m; i++ {
+			mergeDecisions[i] = MergeDecision{src: -1, gain: 0.0}
 		}
-	}
+		mergeDecisions[bestMerge.dst].src = mergeOrders[0]
+		mergeDecisions[bestMerge.dst].gain = bestMerge.gain
+		mergeDecisions[communityIDs[mergeOrders[0]]].src = -2
+		//fmt.Printf("move %d to cluster %d for gain %v\n", mergeOrders[0], bestMerge.dst, bestMerge.gain)
+		totalGain := bestMerge.gain
+		for i := 1; i < n; i++ {
+			// skip those in communities that have already changed
+			uI := mergeOrders[i]
+			oldCuI := communityIDs[uI]
+			if mergeDecisions[oldCuI].src >= 0 || mergeDecisions[oldCuI].src < -1 {
+				//fmt.Printf("cannot move %d out of cluster %d\n", i, oldCuI)
+				continue
+			}
 
-	// -------------------------------------------------------------------------
-	// step 5: return the result
-	return refinedCommunties, refinement
-}
+			// skip those does not request to move
+			mergeI := mergeRequests[uI]
+			newCuI := mergeI.dst
+			if newCuI < 0 {
+				continue
+			}
 
-// =============================================================================
-// func Leiden
-// brief description: Leiden algorithm for partition optimization of
-//	concurrence graphs.
-// input:
-//	qm: a quality model.
-//	communities: a list of clusters.
-//	opts: an optional list of options
-// output:
-//	the optimized communities that maximizes quality
-// note:
-//	If the input communities is empty, this function will act as the classical
-//	Leiden algorithm that uses single point communities as the initial
-//	communities.
-func Leiden(qm QualityModel, communities []map[uint]bool, gamma, theta float64,
-	opts ...string) []map[uint]bool {
-	// step 1: parsing options
-	useSeqSelector := true
-	multiResolution := true
-	shuffle := false
-	for _, opt := range opts {
-		switch opt {
-		case "priority selector":
-			useSeqSelector = false
-		case "sequential selector":
-			useSeqSelector = true
-		case "single resolution":
-			multiResolution = false
-		case "multiple resolution":
-			multiResolution = true
-		case "shuffle":
-			shuffle = true
-		case "no shuffle":
-			shuffle = false
-		}
-	}
+			// skip those want to enter communities that have already changed
+			if mergeDecisions[newCuI].src >= 0 || mergeDecisions[newCuI].src < -1 {
+				//fmt.Printf("cannot move %d of cluster %d into cluster %d\n", i, oldCuI, newCuI)
+				continue
+			}
 
-	// -------------------------------------------------------------------------
-	// step 2: complete communities with isolated points added as single point
-	// communities.
-	result := qm.GetCompleteCommunities(communities)
-	n := qm.GetN()
-
-	// -------------------------------------------------------------------------
-	// step 3: get the community ID for each point
-	communityIDs := make([]uint, n)
-	for communityID, community := range result {
-		for point, _ := range community {
-			communityIDs[point] = uint(communityID)
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// step 4: iteratively scan through the points to find out what is the best
-	// community for a point. If all points are in their best communities, stop
-	// the iteration.
-	m := uint(len(result))
-	for {
-		// (4.1) create the access order of points
-		points := make([]uint, n)
-		for i := 0; i < int(n); i++ {
-			points[i] = uint(i)
-		}
-
-		// (4.2) optionally, shuffle the access order of points
-		if shuffle {
-			rand.Shuffle(int(n), func(i, j int) {
-				points[i], points[j] = points[j], points[i]
-			})
+			// confirm the request
+			mergeDecisions[newCuI].src = uI
+			mergeDecisions[newCuI].gain = mergeI.gain
+			mergeDecisions[oldCuI].src = -2
+			//fmt.Printf("move %d of cluster %d into cluster %d for gain %v\n", uI, oldCuI, newCuI, mergeI.gain)
+			totalGain += mergeI.gain
 		}
 
 		// (4.3) move points
-		if useSeqSelector {
-			done := true
-			for _, u := range points {
+		numMoves := 0
+		for i := 0; i < m; i++ {
+			if mergeDecisions[i].src >= 0 {
+				u := mergeDecisions[i].src
 				oldCu := communityIDs[u]
-				bestDeltaQuality := 0.0
-				bestNewCu := oldCu
-				for newCu := uint(0); newCu < m; newCu++ {
-					deltaQuality := qm.DeltaQuality(result, u, oldCu, newCu)
-					if deltaQuality > bestDeltaQuality {
-						bestDeltaQuality = deltaQuality
-						bestNewCu = newCu
-					}
-				}
-
-				if bestDeltaQuality > 0.0 {
-					delete(result[oldCu], u)
-					result[bestNewCu][u] = true
-					communityIDs[u] = bestNewCu
-					done = false
-				}
+				communityIDs[u] = i
+				communities[i][u] = true
+				delete(communities[oldCu], u)
+				numMoves++
 			}
-			if done {
-				break
-			}
-		} else {
-			bestDeltaQuality := 0.0
-			bestU := uint(0)
-			oldCBestU := communityIDs[0]
-			bestNewCu := oldCBestU
-			for _, u := range points {
-				oldCu := communityIDs[u]
-				for newCu := uint(0); newCu < m; newCu++ {
-					deltaQuality := qm.DeltaQuality(result, u, oldCu, newCu)
-					if deltaQuality > bestDeltaQuality {
-						bestDeltaQuality = deltaQuality
-						bestU = u
-						oldCBestU = oldCu
-						bestNewCu = newCu
-					}
-				}
-			}
-			if bestDeltaQuality == 0.0 {
-				break
-			}
-			delete(result[oldCBestU], bestU)
-			result[bestNewCu][bestU] = true
-			communityIDs[bestU] = bestNewCu
 		}
-	}
 
-	// -------------------------------------------------------------------------
-	// step 5: remove empty communities
-	oldResult := result
-	result = []map[uint]bool{}
-	for _, c := range oldResult {
-		if len(c) > 0 {
-			result = append(result, c)
+		// (4.4) remove empty communities
+		lastC := m - 1
+		for len(communities[lastC]) == 0 {
+			lastC--
 		}
-	}
+		//fmt.Printf("lastC = %d\n", lastC)
+		for c := 0; c <= lastC; c++ {
+			community := communities[c]
+			if len(community) == 0 {
+				communities[c] = communities[lastC]
+				communities[lastC] = community
+				//oldLastC := lastC
+				for len(communities[lastC]) == 0 && lastC > c {
+					lastC--
+				}
+				//fmt.Printf("%d is empty, switch with %d, lastC = %d\n", c, oldLastC, lastC)
+			}
+		}
+		communities = communities[:lastC+1]
+		for c, community := range communities {
+			for u, _ := range community {
+				communityIDs[u] = c
+			}
+		}
 
-	// -------------------------------------------------------------------------
-	// step 6: if required, do the multi-resolution part
-	if multiResolution {
-		// ---------------------------------------------------------------------
-		// (6.1) refine the result
-		refinedCommunities, refinement := refineForLeiden(qm, result, gamma, theta)
-
-		// ---------------------------------------------------------------------
-		// (6.2) create aggregate network from refined
-		newQM := qm.Aggregate(refinedCommunities)
-
-		// ---------------------------------------------------------------------
-		// (6.2) compute aggregated result from the aggregate network
-		aggResult := Leiden(newQM, refinement, gamma, theta, opts...)
-
-		// -------------------------------------------------------------------------
-		// (6.3) flatten the aggResult with refinedCommunities into result
-		result = flattenCommunities(aggResult, refinedCommunities)
+		// (4.5) report statistics
+		fmt.Printf("iter %d: move %d points, gain %v\n", numIters, numMoves, totalGain)
+		numIters++
 	}
 
 	// -------------------------------------------------------------------------
 	// step 7: return the result
-	return result
+	return communities, communityIDs
 }
+
+// // =============================================================================
+// // func refineForLeiden
+// // brief description: refine communities for Leiden algorithm
+// // input:
+// //	qm: a quality model.
+// //	communities: a list of clusters
+// //	gamma: the threshold for qm.connectsWell
+// //	theta: a threshold for sampling probablities
+// // output:
+// //	refinedCommunities, refinement
+// //	refinedCommunities: the result communities refined from input communities.
+// //	refinement: for each input community, list which refined communities it
+// //		contains.
+// func refineForLeiden(qm QualityModel, communities []map[uint]bool,
+// 	gamma, theta float64) ([]map[uint]bool, []map[uint]bool) {
+// 	if gamma <= 0.0 || theta <= 0.0 {
+// 		log.Fatal("gamma and theta must be > 0.")
+// 	}
+
+// 	// -------------------------------------------------------------------------
+// 	// step 1: initialize result with singleton communities
+// 	n := qm.GetN()
+// 	refinedCommunties := make([]map[uint]bool, n)
+// 	for i := uint(0); i < n; i++ {
+// 		refinedCommunties[i] = map[uint]bool{i: true}
+// 	}
+
+// 	// -------------------------------------------------------------------------
+// 	// step 2: find out for each point which input community it is in.
+// 	inputCommunityID := make([]int, n)
+// 	for idxC, c := range communities {
+// 		for u, _ := range c {
+// 			inputCommunityID[u] = idxC
+// 		}
+// 	}
+
+// 	// -------------------------------------------------------------------------
+// 	// step 3: iteratively merge communities in result based on five rules:
+// 	//	1. 	A community in result can only be merged with a sub-community in
+// 	//		one of the input communties.
+// 	//	2.	A communtiy in result is merged only if the merge increases the
+// 	//		quality of the result.
+// 	//	3.	Two communities are merged only if both of them are well connected
+// 	//		to input communities with threshold gamma and at least one of them
+// 	//		is singleton.
+// 	//	4.	Tow communities are merged only if they are connected.
+// 	//	5.	When a community can be merged with multiple communities, we select
+// 	//		which to be merged with randomly with sampling probablities set as
+// 	//		proportional to 1/theta * qualityGain
+// 	for {
+// 		done := true
+// 		for i, refinedCi := range refinedCommunties {
+// 			// ----------------------------------------------------------------
+// 			// (3.1) skip non-singleton communities in result
+// 			if len(refinedCi) > 1 {
+// 				continue
+// 			}
+
+// 			// ----------------------------------------------------------------
+// 			// (3.2) skip those refinedCi not connected well with any of the
+// 			// input communities
+// 			inputC := communities[inputCommunityID[i]]
+// 			if !qm.ConnectsWell(refinedCi, inputC, gamma) {
+// 				continue
+// 			}
+
+// 			// ----------------------------------------------------------------
+// 			// (3.3) find those result communities in the same input community
+// 			// as refinedC that has at least one node connected to refinedCi.
+// 			// This enforces rule 1 and 4.
+// 			connected := []uint{}
+// 			u := uint(i)
+// 			for j, _ := range inputC {
+// 				refinedCj := refinedCommunties[j]
+// 				// skip empty result communities
+// 				if len(refinedCj) == 0 {
+// 					continue
+// 				}
+
+// 				// Check whether there is at least one node connected to
+// 				// refinedCi. If there is, append j to connected
+// 				for v, _ := range refinedCj {
+// 					if qm.Connects(u, v) {
+// 						connected = append(connected, j)
+// 						break
+// 					}
+// 				}
+// 			}
+
+// 			// ----------------------------------------------------------------
+// 			// (3.4) scan throughs connected to search for those resultCi can
+// 			// be merged with.
+// 			logProb := map[uint]float64{}
+// 			sumLogProb := 0.0
+// 			for _, j := range connected {
+// 				refinedCj := refinedCommunties[j]
+
+// 				// Skip this refinedCj if it is not connected well to inputC.
+// 				// This completes the enforcement of rule 3 with (3.1) & (3.2).
+// 				if !qm.ConnectsWell(refinedCj, inputC, gamma) {
+// 					continue
+// 				}
+
+// 				// Compute the quality gain when merging resultCi and resultCj
+// 				deltaQuality := qm.DeltaQuality(refinedCommunties, u, u, j)
+
+// 				// Skip this if the quality gain is not positive
+// 				if deltaQuality <= 0.0 {
+// 					continue
+// 				}
+
+// 				// record a sampling probability
+// 				myLogProb := deltaQuality / theta
+// 				logProb[j] = myLogProb
+// 				sumLogProb += myLogProb
+// 			}
+
+// 			// ----------------------------------------------------------------
+// 			// (3.5) if none resultCi be merged with, skip this resultCi
+// 			if len(logProb) == 0 {
+// 				continue
+// 			}
+
+// 			// ----------------------------------------------------------------
+// 			// (3.6) normalize the sampling probabilities
+// 			for j, value := range logProb {
+// 				logProb[j] = value - sumLogProb
+// 			}
+
+// 			// ----------------------------------------------------------------
+// 			// (3.7) sample a resultCj using logProb
+// 			// first, get a random number x within [0.0, 1.0)
+// 			x := rand.Float64()
+// 			// then, scan through logProb to find the sample
+// 			y := 0.0
+// 			sample := uint(0)
+// 			for j, value := range logProb {
+// 				prob := math.Exp(value)
+// 				y += prob
+// 				if y >= x {
+// 					sample = j
+// 					break
+// 				}
+// 			}
+
+// 			// ----------------------------------------------------------------
+// 			// (3.8) now merge resultCi and sample
+// 			refinedCommunties[i] = map[uint]bool{}
+// 			refinedCommunties[sample][u] = true
+// 			done = false
+// 		}
+
+// 		// ---------------------------------------------------------------------
+// 		// end the loop if no merge happens
+// 		if done {
+// 			break
+// 		}
+// 	}
+
+// 	// -------------------------------------------------------------------------
+// 	// step 4: remove empty communties in result and record non-empty ones in
+// 	// the refinement mapping
+// 	oldRefinedCommunities := refinedCommunties
+// 	refinedCommunties = []map[uint]bool{}
+// 	refinement := make([]map[uint]bool, len(communities))
+// 	for i := 0; i < len(communities); i++ {
+// 		refinement[i] = map[uint]bool{}
+// 	}
+// 	for i, c := range oldRefinedCommunities {
+// 		if len(c) > 0 {
+// 			newI := uint(len(refinedCommunties))
+// 			refinement[inputCommunityID[i]][newI] = true
+// 			refinedCommunties = append(refinedCommunties, c)
+// 		}
+// 	}
+
+// 	// -------------------------------------------------------------------------
+// 	// step 5: return the result
+// 	return refinedCommunties, refinement
+// }
+
+// // =============================================================================
+// // func Leiden
+// // brief description: Leiden algorithm for partition optimization of
+// //	concurrence graphs.
+// // input:
+// //	qm: a quality model.
+// //	communities: a list of clusters.
+// //	opts: an optional list of options
+// // output:
+// //	the optimized communities that maximizes quality
+// // note:
+// //	If the input communities is empty, this function will act as the classical
+// //	Leiden algorithm that uses single point communities as the initial
+// //	communities.
+// func Leiden(qm QualityModel, communities []map[uint]bool, gamma, theta float64,
+// 	opts ...string) []map[uint]bool {
+// 	// step 1: parsing options
+// 	useSeqSelector := true
+// 	multiResolution := true
+// 	shuffle := false
+// 	for _, opt := range opts {
+// 		switch opt {
+// 		case "priority selector":
+// 			useSeqSelector = false
+// 		case "sequential selector":
+// 			useSeqSelector = true
+// 		case "single resolution":
+// 			multiResolution = false
+// 		case "multiple resolution":
+// 			multiResolution = true
+// 		case "shuffle":
+// 			shuffle = true
+// 		case "no shuffle":
+// 			shuffle = false
+// 		}
+// 	}
+
+// 	// -------------------------------------------------------------------------
+// 	// step 2: complete communities with isolated points added as single point
+// 	// communities.
+// 	result := qm.GetCompleteCommunities(communities)
+// 	n := qm.GetN()
+
+// 	// -------------------------------------------------------------------------
+// 	// step 3: get the community ID for each point
+// 	communityIDs := make([]uint, n)
+// 	for communityID, community := range result {
+// 		for point, _ := range community {
+// 			communityIDs[point] = uint(communityID)
+// 		}
+// 	}
+
+// 	// -------------------------------------------------------------------------
+// 	// step 4: iteratively scan through the points to find out what is the best
+// 	// community for a point. If all points are in their best communities, stop
+// 	// the iteration.
+// 	m := uint(len(result))
+// 	for {
+// 		// (4.1) create the access order of points
+// 		points := make([]uint, n)
+// 		for i := 0; i < int(n); i++ {
+// 			points[i] = uint(i)
+// 		}
+
+// 		// (4.2) optionally, shuffle the access order of points
+// 		if shuffle {
+// 			rand.Shuffle(int(n), func(i, j int) {
+// 				points[i], points[j] = points[j], points[i]
+// 			})
+// 		}
+
+// 		// (4.3) move points
+// 		if useSeqSelector {
+// 			done := true
+// 			for _, u := range points {
+// 				oldCu := communityIDs[u]
+// 				bestDeltaQuality := 0.0
+// 				bestNewCu := oldCu
+// 				for newCu := uint(0); newCu < m; newCu++ {
+// 					deltaQuality := qm.DeltaQuality(result, u, oldCu, newCu)
+// 					if deltaQuality > bestDeltaQuality {
+// 						bestDeltaQuality = deltaQuality
+// 						bestNewCu = newCu
+// 					}
+// 				}
+
+// 				if bestDeltaQuality > 0.0 {
+// 					delete(result[oldCu], u)
+// 					result[bestNewCu][u] = true
+// 					communityIDs[u] = bestNewCu
+// 					done = false
+// 				}
+// 			}
+// 			if done {
+// 				break
+// 			}
+// 		} else {
+// 			bestDeltaQuality := 0.0
+// 			bestU := uint(0)
+// 			oldCBestU := communityIDs[0]
+// 			bestNewCu := oldCBestU
+// 			for _, u := range points {
+// 				oldCu := communityIDs[u]
+// 				for newCu := uint(0); newCu < m; newCu++ {
+// 					deltaQuality := qm.DeltaQuality(result, u, oldCu, newCu)
+// 					if deltaQuality > bestDeltaQuality {
+// 						bestDeltaQuality = deltaQuality
+// 						bestU = u
+// 						oldCBestU = oldCu
+// 						bestNewCu = newCu
+// 					}
+// 				}
+// 			}
+// 			if bestDeltaQuality == 0.0 {
+// 				break
+// 			}
+// 			delete(result[oldCBestU], bestU)
+// 			result[bestNewCu][bestU] = true
+// 			communityIDs[bestU] = bestNewCu
+// 		}
+// 	}
+
+// 	// -------------------------------------------------------------------------
+// 	// step 5: remove empty communities
+// 	oldResult := result
+// 	result = []map[uint]bool{}
+// 	for _, c := range oldResult {
+// 		if len(c) > 0 {
+// 			result = append(result, c)
+// 		}
+// 	}
+
+// 	// -------------------------------------------------------------------------
+// 	// step 6: if required, do the multi-resolution part
+// 	if multiResolution {
+// 		// ---------------------------------------------------------------------
+// 		// (6.1) refine the result
+// 		refinedCommunities, refinement := refineForLeiden(qm, result, gamma, theta)
+
+// 		// ---------------------------------------------------------------------
+// 		// (6.2) create aggregate network from refined
+// 		newQM := qm.Aggregate(refinedCommunities)
+
+// 		// ---------------------------------------------------------------------
+// 		// (6.2) compute aggregated result from the aggregate network
+// 		aggResult := Leiden(newQM, refinement, gamma, theta, opts...)
+
+// 		// -------------------------------------------------------------------------
+// 		// (6.3) flatten the aggResult with refinedCommunities into result
+// 		result = flattenCommunities(aggResult, refinedCommunities)
+// 	}
+
+// 	// -------------------------------------------------------------------------
+// 	// step 7: return the result
+// 	return result
+// }
